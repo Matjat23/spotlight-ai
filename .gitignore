@@ -1,0 +1,62 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Model weights and caches (too big for git)
+weights/
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+.cache/
+
+# Partner data: photos and videos of children, never commit
+data/
+dataset/
+images/
+photos/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.bmp
+*.tif
+*.tiff
+*.heic
+*.mp4
+*.mov
+*.avi
+*.zip
+*.tar
+*.7z
+
+# Files that can contain names or personal data from the partners
+*.csv
+*.xlsx
+*.json
+
+# Outputs (captions, embeddings, search index)
+outputs/
+*.npy
+*.npz
+*.parquet
+*.pkl
+*.faiss
+
+# Notebook outputs can show photos, so notebooks stay local
+*.ipynb
+
+# Secrets and tokens
+.env
+*.key
+secrets/
+
+# Editor settings
+.vscode/
+
+# Internal team notes (strategy, not for the public repo)
+PREP.md
