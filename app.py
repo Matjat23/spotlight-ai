@@ -185,6 +185,7 @@ def index():
                 with ui.card().tight().classes("cursor-pointer").on("click", lambda r=r: open_detail(r["id"])):
                     ui.image(f"/photo/{r['id']}/thumb").classes("h-40").props("fit=cover")
                     with ui.card_section().classes("q-pa-sm"):
+                        ui.label(f"Photo {r['id']}").classes("text-caption text-grey-7")
                         ui.label(r["caption"]).classes("text-body2")
                         with ui.row().classes("gap-1 q-mt-xs"):
                             ui.badge(r["activity"]).props("color=primary")

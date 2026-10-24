@@ -93,8 +93,10 @@ class SearchEngine:
 
     # Search
 
-    def search(self, query, filters=None, top=40):
-        """Returns a list of (row, score, why) best first. Empty query lists everything."""
+    def search(self, query, filters=None, top=40, use=("image", "caption", "keyword")):
+        """Returns a list of (row, score, why) best first. Empty query lists everything.
+
+        use picks which searches are combined, evaluate.py uses it to compare them."""
         start = time.time()
         ids = self._filtered(filters or {})
         if not query.strip():
@@ -109,6 +111,8 @@ class SearchEngine:
         fused = {}
         why = {}
         for name, scores in lists.items():
+            if name not in use:
+                continue
             order = [i for i in np.argsort(-scores) if i in ids]
             if name == "keyword":
                 order = [i for i in order if scores[i] > 0]
