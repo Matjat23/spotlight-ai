@@ -1,0 +1,350 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spotlight AI Skeleton</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Atkinson+Hyperlegible:wght@400;700&display=swap">
+<style>
+/* Layout: app shell. Night-indigo top band with tabs, search first, results grid + side detail panel, discussion notes at the bottom. */
+:root {
+  --bg: #f6f5fa;
+  --surface: #ffffff;
+  --fg: #1d1b33;
+  --muted: #5d5a78;
+  --line: #dddbe9;
+  --band: #24214f;
+  --band-fg: #f3f1ff;
+  --accent: #b9770e;
+  --accent-soft: #fbefd9;
+  --ph1: #d9d5ee;
+  --ph2: #ebe3d3;
+  --ok: #2e7d4f;
+  --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14131f; --surface: #1d1c2c; --fg: #ecebf6; --muted: #a6a3c2; --line: #33314a;
+    --band: #0e0d1a; --band-fg: #f3f1ff; --accent: #e7a93d; --accent-soft: #3a2e17;
+    --ph1: #2b2846; --ph2: #3a3326; --ok: #6cc595; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #14131f; --surface: #1d1c2c; --fg: #ecebf6; --muted: #a6a3c2; --line: #33314a;
+  --band: #0e0d1a; --band-fg: #f3f1ff; --accent: #e7a93d; --accent-soft: #3a2e17;
+  --ph1: #2b2846; --ph2: #3a3326; --ok: #6cc595; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 15px; line-height: 1.5; }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--band); }
+.wrap { max-width: 1180px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+header { background: var(--band); color: var(--band-fg); position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; }
+header .wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 28px; padding-block: 14px; }
+.brand { font-family: var(--font-display); font-weight: 700; font-size: 1.35rem; letter-spacing: -0.01em; display: flex; align-items: center; gap: 10px; }
+.brand .beam { width: 22px; height: 22px; border-radius: 50%; background: radial-gradient(circle at 50% 40%, var(--accent) 0 35%, transparent 36%), conic-gradient(from 200deg, transparent 0 70%, color-mix(in srgb, var(--accent) 45%, transparent) 70% 85%, transparent 85%); }
+.brand small { font-family: var(--font-body); font-weight: 400; font-size: .8rem; opacity: .75; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; }
+nav button { background: none; border: 0; color: var(--band-fg); font: inherit; padding: 6px 12px; border-radius: 999px; cursor: pointer; opacity: .8; }
+nav button[aria-selected="true"] { background: color-mix(in srgb, var(--band-fg) 14%, transparent); opacity: 1; font-weight: 700; }
+nav button:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.badge { margin-left: auto; font-size: .78rem; border: 1px solid color-mix(in srgb, var(--band-fg) 35%, transparent); padding: 3px 10px; border-radius: 999px; }
+main { padding-block: 28px 56px; }
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(1.6rem, 3.5vw, 2.3rem); letter-spacing: -0.02em; }
+h2 { font-size: 1.3rem; }
+h3 { font-size: 1.02rem; }
+.lede { color: var(--muted); max-width: 62ch; margin: 6px 0 0; }
+.searchbox { margin-top: 18px; display: flex; gap: 8px; }
+.searchbox input { flex: 1; min-width: 0; font: inherit; font-size: 1.05rem; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); color: var(--fg); }
+.btn { font: inherit; font-weight: 700; padding: 10px 18px; border-radius: 10px; border: 0; background: var(--accent); color: #1d1405; cursor: pointer; }
+.btn.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); font-weight: 400; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.chip { font: inherit; font-size: .85rem; padding: 5px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); color: var(--fg); cursor: pointer; }
+.chip[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); }
+.label { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 700; }
+.layout { display: grid; grid-template-columns: 210px minmax(0, 1fr) 300px; gap: 24px; margin-top: 26px; align-items: start; }
+.filters { display: grid; gap: 18px; }
+.filters fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 6px; }
+.filters label { display: flex; gap: 8px; align-items: center; font-size: .92rem; }
+.filters select { font: inherit; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--fg); }
+.resultsbar { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; cursor: pointer; text-align: left; padding: 0; font: inherit; color: inherit; display: flex; flex-direction: column; }
+.card[aria-current="true"] { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.ph { aspect-ratio: 4 / 3; max-width: 100%; display: grid; place-items: center; color: var(--muted); font-size: .78rem; background: repeating-linear-gradient(135deg, var(--ph1) 0 14px, var(--ph2) 14px 28px); }
+.card .body { padding: 10px 12px 12px; display: grid; gap: 6px; }
+.card p { margin: 0; font-size: .88rem; }
+.tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.tag { font-size: .72rem; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--fg); }
+.score { font-size: .75rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 16px; display: grid; gap: 12px; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 80px); }
+.panel .ph { border-radius: 10px; }
+.uses { display: grid; gap: 6px; }
+.uses label { display: flex; gap: 8px; font-size: .9rem; }
+.empty { color: var(--muted); font-size: .9rem; }
+.section { margin-top: 48px; padding-top: 28px; border-top: 1px solid var(--line); }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-top: 16px; }
+.box { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px; display: grid; gap: 8px; align-content: start; }
+.box ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+.pipeline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 14px; }
+.step { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; font-size: .9rem; }
+.arrow { color: var(--muted); }
+.view[hidden] { display: none; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: .92rem; }
+th { font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.tablewrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; margin-top: 16px; }
+.note { font-size: .82rem; color: var(--muted); }
+@media (max-width: 980px) { .layout { grid-template-columns: 1fr; } .panel { position: static; } .filters { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<header>
+  <div class="wrap">
+    <div class="brand"><span class="beam" aria-hidden="true"></span>Spotlight AI <small>photo search for Dreams Come True staff</small></div>
+    <nav role="tablist" aria-label="Pages">
+      <button role="tab" id="tab-search" aria-selected="true" data-view="search">Search</button>
+      <button role="tab" id="tab-collections" aria-selected="false" data-view="collections">Collections</button>
+      <button role="tab" id="tab-upload" aria-selected="false" data-view="upload">Add photos</button>
+      <button role="tab" id="tab-results" aria-selected="false" data-view="results">How well it works</button>
+    </nav>
+    <span class="badge">Skeleton v0.1, placeholder photos</span>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section class="view" id="view-search">
+    <h1>Find the right photo in seconds</h1>
+    <p class="lede">Type what you need for a newsletter, donor report or social post. The real app searches the 130 DCT photos on our laptop. Here every photo is a placeholder, so no real kids are shown.</p>
+    <form class="searchbox" id="searchform">
+      <label for="q" class="label" hidden>Search photos</label>
+      <input id="q" type="search" placeholder="e.g. family smiling at Disney" autocomplete="off">
+      <button class="btn" type="submit">Search</button>
+    </form>
+    <div class="chips" id="examples" aria-label="Example searches"></div>
+
+    <div class="layout">
+      <aside class="filters" aria-label="Filters">
+        <fieldset>
+          <span class="label">Photo type</span>
+          <label><input type="checkbox" id="f-headshot" value="headshot"> Headshot</label>
+          <label><input type="checkbox" id="f-family" value="family"> Family</label>
+          <label><input type="checkbox" id="f-posed" value="posed"> Posed</label>
+          <label><input type="checkbox" id="f-event" value="event"> Event</label>
+          <label><input type="checkbox" id="f-staff" value="staff"> Staff / volunteers</label>
+        </fieldset>
+        <fieldset>
+          <span class="label">Use for</span>
+          <label><input type="checkbox" id="f-donor" value="donor"> Donor report</label>
+          <label><input type="checkbox" id="f-social" value="social"> Social media</label>
+          <label><input type="checkbox" id="f-news" value="newsletter"> Newsletter</label>
+        </fieldset>
+        <fieldset>
+          <span class="label">Year</span>
+          <select id="f-year"><option value="">Any year</option><option>2026</option><option>2025</option><option>2021</option><option>2020</option><option value="none">No date</option></select>
+        </fieldset>
+        <p class="note">Open question: which filters do staff really use? Ask at the Saturday check-in.</p>
+      </aside>
+
+      <div style="min-width:0">
+        <div class="resultsbar">
+          <h2 id="count">12 photos</h2>
+          <span class="note">Sorted by match score (CLIP similarity)</span>
+        </div>
+        <div class="grid" id="grid"></div>
+      </div>
+
+      <aside class="panel" id="panel" aria-live="polite"></aside>
+    </div>
+  </section>
+
+  <section class="view" id="view-collections" hidden>
+    <h1>Collections</h1>
+    <p class="lede">Staff collect photos for one job, like the spring donor report, then hand the set to whoever designs it.</p>
+    <div class="cols" id="collections"></div>
+    <p class="note" style="margin-top:14px">Open question: do we build this, or is search alone enough for the demo?</p>
+  </section>
+
+  <section class="view" id="view-upload" hidden>
+    <h1>Add new photos</h1>
+    <p class="lede">After each event, staff drop the new photos in a folder. Spotlight writes captions and tags overnight, on the same computer.</p>
+    <div class="cols">
+      <div class="box"><span class="label">Step 1</span><h3>Drop photos in the folder</h3><p class="note">JPG, PNG and iPhone HEIC all work.</p></div>
+      <div class="box"><span class="label">Step 2</span><h3>Spotlight reads each photo</h3><p class="note">Caption, tags, embedding. About 1 second per photo on our GPU.</p></div>
+      <div class="box"><span class="label">Step 3</span><h3>Check and fix tags</h3><p class="note">Staff can correct a wrong tag. Corrections make search better.</p></div>
+    </div>
+  </section>
+
+  <section class="view" id="view-results" hidden>
+    <h1>How well it works</h1>
+    <p class="lede">The judges want numbers. Isak's test set: 40 searches with the right photos marked by hand.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Model</th><th>Recall@5</th><th>Recall@10</th><th>MRR</th><th>Seconds per photo</th></tr></thead>
+        <tbody>
+          <tr><td>CLIP only</td><td>filled at CP2</td><td>filled at CP2</td><td>filled at CP2</td><td>filled at CP2</td></tr>
+          <tr><td>BLIP captions + CLIP</td><td>filled at CP2</td><td>filled at CP2</td><td>filled at CP2</td><td>filled at CP2</td></tr>
+          <tr><td>Florence-2 captions + CLIP</td><td>filled at CP2</td><td>filled at CP2</td><td>filled at CP2</td><td>filled at CP2</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>How it works</h2>
+    <div class="pipeline">
+      <span class="step">130 DCT photos (local only)</span><span class="arrow">→</span>
+      <span class="step">Captions (BLIP / Florence-2)</span><span class="arrow">→</span>
+      <span class="step">Tags from DCT's own words</span><span class="arrow">→</span>
+      <span class="step">CLIP search index</span><span class="arrow">→</span>
+      <span class="step">This app</span>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>For our discussion</h2>
+    <div class="cols">
+      <div class="box">
+        <span class="label">What we know</span>
+        <ul>
+          <li>Users: DCT staff doing marketing</li>
+          <li>Photos go to donors, funders and families</li>
+          <li>Real photos are fine in the live demo</li>
+          <li>Judges want accuracy and a usable tool</li>
+          <li>130 photos: headshots, families, posed, shopping</li>
+        </ul>
+      </div>
+      <div class="box">
+        <span class="label">Decide as a team</span>
+        <ul>
+          <li>Which 4 pages do we really build?</li>
+          <li>Which filters matter most?</li>
+          <li>Tag list: which words does DCT use?</li>
+          <li>Gradio app or a simple web page?</li>
+          <li>Who demos on Sunday?</li>
+        </ul>
+      </div>
+      <div class="box">
+        <span class="label">Never</span>
+        <ul>
+          <li>Push photos or names to GitHub</li>
+          <li>Send photos to a cloud API</li>
+          <li>Put kids' names in captions or slides</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const PHOTOS = [
+  { id: 1, cap: "Family of four smiling together outdoors", tags: ["family", "smiling", "outdoors"], type: "family", uses: ["donor", "newsletter"], year: "2025" },
+  { id: 2, cap: "Close-up headshot of a smiling child", tags: ["headshot", "smiling"], type: "headshot", uses: ["social", "donor"], year: "2026" },
+  { id: 3, cap: "Child holding shopping bags in a store", tags: ["shopping", "child", "indoors"], type: "event", uses: ["social"], year: "2021" },
+  { id: 4, cap: "Posed portrait of a girl in front of a backdrop", tags: ["posed", "portrait"], type: "posed", uses: ["newsletter"], year: "2026" },
+  { id: 5, cap: "Group of staff and volunteers in matching shirts", tags: ["staff", "group", "volunteers"], type: "staff", uses: ["newsletter", "donor"], year: "2025" },
+  { id: 6, cap: "Two brothers laughing side by side", tags: ["siblings", "laughing", "boys"], type: "family", uses: ["social"], year: "2020" },
+  { id: 7, cap: "Child cut out on a white background", tags: ["cutout", "child"], type: "posed", uses: ["social", "newsletter"], year: "none" },
+  { id: 8, cap: "Family hugging at a celebration", tags: ["family", "hug", "celebration"], type: "event", uses: ["donor"], year: "2025" },
+  { id: 9, cap: "Headshot of a teenage boy with a big smile", tags: ["headshot", "teen", "smiling"], type: "headshot", uses: ["donor", "social"], year: "2026" },
+  { id: 10, cap: "Kids picking toys during a shopping spree", tags: ["shopping", "toys", "excited"], type: "event", uses: ["social", "newsletter"], year: "2021" },
+  { id: 11, cap: "Mother and daughter posing together", tags: ["family", "posed", "mother"], type: "family", uses: ["newsletter"], year: "none" },
+  { id: 12, cap: "Volunteers handing out gifts", tags: ["volunteers", "gifts", "staff"], type: "staff", uses: ["donor"], year: "2020" }
+];
+const EXAMPLES = ["family smiling", "headshot for donor report", "shopping trip", "staff and volunteers", "kids laughing"];
+const COLLECTIONS = [
+  { name: "Spring donor report", ids: [1, 8, 9] },
+  { name: "Instagram this week", ids: [2, 3, 10] },
+  { name: "Volunteer thank-you email", ids: [5, 12] }
+];
+
+const $ = (s) => document.querySelector(s);
+let selected = 1;
+
+function score(p, q) {
+  if (!q) return 0.5 + (p.id % 5) / 20;
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+  const text = (p.cap + " " + p.tags.join(" ")).toLowerCase();
+  const hits = words.filter((w) => text.includes(w)).length;
+  return hits / words.length;
+}
+
+function filtered() {
+  const q = $("#q").value.trim();
+  const types = [...document.querySelectorAll('.filters fieldset:nth-child(1) input:checked')].map((i) => i.value);
+  const uses = [...document.querySelectorAll('.filters fieldset:nth-child(2) input:checked')].map((i) => i.value);
+  const year = $("#f-year").value;
+  return PHOTOS
+    .map((p) => ({ ...p, s: score(p, q) }))
+    .filter((p) => (!q || p.s > 0) && (!types.length || types.includes(p.type)) && (!uses.length || uses.some((u) => p.uses.includes(u))) && (!year || p.year === year))
+    .sort((a, b) => b.s - a.s);
+}
+
+function render() {
+  const list = filtered();
+  $("#count").textContent = list.length === 1 ? "1 photo" : list.length + " photos";
+  $("#grid").innerHTML = list.length ? list.map((p) => `
+    <button class="card" data-id="${p.id}" ${p.id === selected ? 'aria-current="true"' : ""}>
+      <div class="ph">Photo ${p.id}</div>
+      <div class="body">
+        <p>${p.cap}</p>
+        <div class="tags">${p.tags.map((t) => `<span class="tag">${t}</span>`).join("")}</div>
+        <span class="score">match ${p.s.toFixed(2)}</span>
+      </div>
+    </button>`).join("") : `<p class="empty">No photos match. Try fewer words or clear a filter.</p>`;
+  renderPanel();
+}
+
+function renderPanel() {
+  const p = PHOTOS.find((x) => x.id === selected);
+  if (!p) { $("#panel").innerHTML = '<p class="empty">Pick a photo to see its details.</p>'; return; }
+  $("#panel").innerHTML = `
+    <div class="ph">Photo ${p.id}</div>
+    <div><span class="label">AI caption</span><p style="margin:4px 0 0">${p.cap}</p></div>
+    <div><span class="label">Tags</span><div class="tags" style="margin-top:6px">${p.tags.map((t) => `<span class="tag">${t}</span>`).join("")}</div></div>
+    <div class="uses"><span class="label">Good for</span>
+      ${["donor", "social", "newsletter"].map((u) => `<label><input type="checkbox" id="use-${u}" ${p.uses.includes(u) ? "checked" : ""} disabled> ${u === "donor" ? "Donor report" : u === "social" ? "Social media" : "Newsletter"}</label>`).join("")}
+    </div>
+    <div class="note">Year: ${p.year === "none" ? "no date in the file" : p.year}</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn" type="button" id="addcol">Add to collection</button>
+      <button class="btn ghost" type="button" id="fixtag">Fix a tag</button>
+    </div>
+    <p class="note" id="panelmsg">Buttons are placeholders for the discussion.</p>`;
+  $("#addcol").onclick = () => { $("#panelmsg").textContent = "Added to \"Spring donor report\" (demo only)."; };
+  $("#fixtag").onclick = () => { $("#panelmsg").textContent = "Tag editing is not built yet."; };
+}
+
+function renderCollections() {
+  $("#collections").innerHTML = COLLECTIONS.map((c) => `
+    <div class="box">
+      <h3>${c.name}</h3>
+      <div class="grid" style="grid-template-columns:repeat(3,1fr);gap:6px">${c.ids.map((i) => `<div class="ph" style="border-radius:6px">${i}</div>`).join("")}</div>
+      <span class="note">${c.ids.length} photos</span>
+    </div>`).join("");
+}
+
+$("#examples").innerHTML = EXAMPLES.map((e) => `<button class="chip" type="button" aria-pressed="false">${e}</button>`).join("");
+$("#examples").addEventListener("click", (e) => {
+  const b = e.target.closest(".chip"); if (!b) return;
+  document.querySelectorAll(".chip").forEach((c) => c.setAttribute("aria-pressed", c === b ? "true" : "false"));
+  $("#q").value = b.textContent; render();
+});
+$("#searchform").addEventListener("submit", (e) => { e.preventDefault(); render(); });
+$("#q").addEventListener("input", render);
+document.querySelectorAll(".filters input, .filters select").forEach((el) => el.addEventListener("change", render));
+$("#grid").addEventListener("click", (e) => {
+  const c = e.target.closest(".card"); if (!c) return;
+  selected = Number(c.dataset.id); render();
+});
+
+const VIEWS = ["search", "collections", "upload", "results"];
+function show(v) {
+  if (!VIEWS.includes(v)) v = "search";
+  VIEWS.forEach((x) => { document.getElementById("view-" + x).hidden = x !== v; document.getElementById("tab-" + x).setAttribute("aria-selected", x === v ? "true" : "false"); });
+}
+document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => show(b.dataset.view)));
+show(location.hash.slice(1));
+renderCollections();
+render();
+</script>
+</html>
