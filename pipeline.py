@@ -281,7 +281,8 @@ FACE_DISTANCE = 0.5    # cosine distance, average linkage. Looser values chain d
 
 
 def find_faces(files):
-    """For each face: (photo index, 512 normalized numbers from ArcFace). Nothing is saved."""
+    """For each face: (photo index, 512 numbers from ArcFace, box, detector score).
+    The box is where the face is, as fractions of the photo size, used for the People page cover."""
     import onnxruntime  # noqa: F401  (loads before insightface so it finds the CUDA libraries from torch)
     from insightface.app import FaceAnalysis
 
@@ -291,34 +292,40 @@ def find_faces(files):
     faces = []
     for n, path in enumerate(files):
         img = np.array(load_image(path, 1280))[:, :, ::-1]  # RGB to BGR, what insightface expects
+        h, w = img.shape[:2]
         for f in app.get(img):
             x1, y1, x2, y2 = f.bbox
             if f.det_score >= FACE_MIN_SCORE and min(x2 - x1, y2 - y1) >= FACE_MIN_SIZE:
-                faces.append((n, f.normed_embedding))
+                box = [round(float(x1) / w, 4), round(float(y1) / h, 4), round(float(x2) / w, 4), round(float(y2) / h, 4)]
+                faces.append((n, f.normed_embedding, box, round(float(f.det_score), 3)))
         if (n + 1) % 20 == 0 or n + 1 == len(files):
             print(f"  Faces {n + 1}/{len(files)}", flush=True)
     return faces
 
 
 def group_people(faces, count):
-    """Groups faces that look alike into P01, P02... Only people seen in 2+ photos get a group."""
+    """Groups faces that look alike into P01, P02... Only people seen in 2+ photos get a group.
+    Returns the groups per photo and a list of grouped faces (photo, person, box, score)."""
     people = [set() for _ in range(count)]
     if len(faces) < 2:
-        return people
-    emb = np.stack([e for _, e in faces])
+        return people, []
+    emb = np.stack([f[1] for f in faces])
     # Average linkage: a face joins a group only if it is close to the group on average. DBSCAN
     # chained different people together (A looks like B, B like C) in our tests.
     labels = AgglomerativeClustering(n_clusters=None, distance_threshold=FACE_DISTANCE,
                                      metric="cosine", linkage="average").fit_predict(emb)
     by_group = {}
-    for (photo, _), lab in zip(faces, labels):
-        if lab >= 0:
-            by_group.setdefault(lab, set()).add(photo)
-    groups = [photos for photos in by_group.values() if len(photos) >= 2]
-    for n, photos in enumerate(sorted(groups, key=len, reverse=True), 1):
+    for f, lab in zip(faces, labels):
+        by_group.setdefault(lab, set()).add(f[0])
+    groups = [(lab, photos) for lab, photos in by_group.items() if len(photos) >= 2]
+    names = {}
+    for n, (lab, photos) in enumerate(sorted(groups, key=lambda g: len(g[1]), reverse=True), 1):
+        names[lab] = f"P{n:02d}"
         for photo in photos:
-            people[photo].add(f"P{n:02d}")
-    return people
+            people[photo].add(names[lab])
+    grouped = [{"photo": f[0], "person": names[lab], "box": f[2], "score": f[3]}
+               for f, lab in zip(faces, labels) if lab in names]
+    return people, grouped
 
 
 def main():
@@ -346,7 +353,10 @@ def main():
     described = describe_with_qwen(files) if use_qwen else [{} for _ in files]
 
     # Pass 2: anonymous person groups from faces
-    people = [set() for _ in files] if args.no_faces else group_people(find_faces(files), len(files))
+    if args.no_faces:
+        people, face_boxes = [set() for _ in files], []
+    else:
+        people, face_boxes = group_people(find_faces(files), len(files))
 
     # Pass 3: CLIP embeddings and label scores (and BLIP captions when Qwen is not used)
     clip = CLIPModel.from_pretrained(CLIP_NAME, torch_dtype=dtype).to(device).eval()
@@ -421,6 +431,9 @@ def main():
         writer.writerows(rows)
     with open(OUT / "photos.json", "w", encoding="utf-8") as f:
         json.dump(rows, f, indent=1)
+    # Only where each grouped face is (no face numbers, no crops), for the People page covers
+    with open(OUT / "faces.json", "w", encoding="utf-8") as f:
+        json.dump(face_boxes, f)
 
     took = time.time() - start
     events = len({r["event_id"] for r in rows})

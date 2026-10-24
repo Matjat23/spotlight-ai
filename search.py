@@ -131,6 +131,10 @@ class SearchEngine:
                 ids = {i for i in ids if self.rows[i][field] == filters[field]}
         if filters.get("attribute"):
             ids = {i for i in ids if filters["attribute"] in self.rows[i]["person_attributes"].split(";")}
+        if filters.get("person"):
+            ids = {i for i in ids if filters["person"] in self.rows[i].get("person_ids", "").split(";")}
+        if filters.get("ids") is not None:
+            ids &= set(filters["ids"])
         if filters.get("year"):
             ids = {i for i in ids if self.rows[i]["taken"].startswith(str(filters["year"]))}
         return ids

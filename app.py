@@ -8,10 +8,11 @@ Runs only on this computer (127.0.0.1), photos never leave the laptop.
 """
 import csv
 import io
+import json
 from pathlib import Path
 
 from fastapi import HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from nicegui import app, ui
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
@@ -26,6 +27,10 @@ THUMBS = ROOT / "outputs" / "thumbs"
 THUMBS.mkdir(parents=True, exist_ok=True)
 
 engine = SearchEngine()
+FACES_FILE = ROOT / "outputs" / "faces.json"
+FACES = json.loads(FACES_FILE.read_text(encoding="utf-8")) if FACES_FILE.exists() else []
+# Favorites only live in memory for now (the look is done, saving comes later)
+FAVORITES = set()
 
 
 # REST API (FastAPI)
@@ -49,9 +54,30 @@ def photo_file(photo_id: int, size: str):
     return FileResponse(path, media_type="image/jpeg")
 
 
+@app.get("/face/{person}")
+def face_cover(person: str):
+    """Round cover for the People page: the clearest face of that person group, cut on the fly.
+    Nothing is written to disk."""
+    faces = [f for f in FACES if f["person"] == person]
+    if not faces:
+        raise HTTPException(404, "No face for that person group")
+    best = max(faces, key=lambda f: f["score"] * (f["box"][2] - f["box"][0]))
+    img = ImageOps.exif_transpose(Image.open(DATA / engine.rows[best["photo"]]["file"])).convert("RGB")
+    w, h = img.size
+    x1, y1, x2, y2 = best["box"]
+    cx, cy = (x1 + x2) / 2 * w, (y1 + y2) / 2 * h
+    side = max((x2 - x1) * w, (y2 - y1) * h) * 1.6
+    crop = img.crop((int(cx - side / 2), int(cy - side / 2), int(cx + side / 2), int(cy + side / 2)))
+    crop.thumbnail((240, 240))
+    buf = io.BytesIO()
+    crop.save(buf, "JPEG", quality=85)
+    return Response(buf.getvalue(), media_type="image/jpeg")
+
+
 @app.get("/api/search")
-def api_search(q: str = "", activity: str = "", location: str = "", attribute: str = "", year: str = "", top: int = 40):
-    filters = {"activity": activity, "location": location, "attribute": attribute, "year": year}
+def api_search(q: str = "", activity: str = "", location: str = "", attribute: str = "", year: str = "",
+               person: str = "", top: int = 40):
+    filters = {"activity": activity, "location": location, "attribute": attribute, "year": year, "person": person}
     hits, took = engine.search(q, filters, top)
     return {"query": q, "ms": round(took * 1000, 1),
             "results": [{**public(r), "score": round(s, 4), "ranks": why} for r, s, why in hits]}
@@ -102,6 +128,9 @@ def public(r):
 
 STATUS_COLOR = {"ai": "grey", "accepted": "positive", "edited": "primary"}
 PAGE_SIZE = 24
+NAV = [("Photos", "photo_library", "/"), ("People", "face", "/people"), ("Places", "place", "/places"),
+       ("Favorites", "star", "/favorites"), ("Review log", "history", "/log")]
+GRID = "display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px"
 
 
 def confirm(question, action):
@@ -114,20 +143,63 @@ def confirm(question, action):
     dlg.open()
 
 
-@ui.page("/")
-def index():
-    state = {"query": "", "pivot": None, "selected": None, "rows": [], "page": 1}
-    facets = engine.facets()
-
+def layout(active):
+    """Header and left sidebar shared by every page, like Google Photos."""
     ui.colors(primary="#24214f", secondary="#b9770e", accent="#b9770e")
     ui.query("body").style("background:#f6f5fa")
-
-    with ui.header().classes("items-center bg-primary q-px-lg"):
+    with ui.left_drawer(value=True, fixed=True).props("width=220 bordered").classes("bg-white q-pt-md") as nav:
+        for name, icon, path in NAV:
+            selected = path == active
+            with ui.item(on_click=lambda path=path: ui.navigate.to(path)).classes(
+                    "rounded-r-full q-mr-sm" + (" bg-amber-1 text-weight-bold" if selected else "")):
+                with ui.item_section().props("avatar"):
+                    ui.icon(icon, color="secondary" if selected else "grey-7")
+                with ui.item_section():
+                    ui.label(name)
+    with ui.header().classes("items-center bg-primary q-px-md"):
+        ui.button(icon="menu", on_click=nav.toggle).props("flat round color=white")
         ui.label("Spotlight AI").classes("text-h6 text-weight-bold")
-        ui.label("photo search for Dreams Come True staff").classes("text-caption opacity-80")
+        ui.label("photo search for Dreams Come True staff").classes("text-caption opacity-80 gt-sm")
         ui.space()
-        ui.link("Review log", "/log").classes("text-white")
-        ui.link("Download index (CSV)", "/api/export.csv").classes("text-white q-ml-md")
+        ui.link("Download index (CSV)", "/api/export.csv").classes("text-white")
+
+
+def star_button(photo_id):
+    """Favorite star. Only kept in memory until the app restarts, saving comes later."""
+    def toggle():
+        FAVORITES.symmetric_difference_update({photo_id})
+        btn.props(f"icon={'star' if photo_id in FAVORITES else 'star_border'}")
+    btn = ui.button(icon="star" if photo_id in FAVORITES else "star_border").props("flat round dense color=amber")
+    btn.on("click.stop", toggle)
+    return btn
+
+
+def photo_card(r, on_open):
+    with ui.card().tight().classes("cursor-pointer relative").on("click", lambda r=r: on_open(r["id"])):
+        ui.image(f"/photo/{r['id']}/thumb").classes("h-40").props("fit=cover")
+        with ui.element("div").classes("absolute-top-right q-ma-xs bg-white rounded-full"):
+            star_button(r["id"])
+        with ui.card_section().classes("q-pa-sm"):
+            ui.label(f"Photo {r['id']}").classes("text-caption text-grey-7")
+            ui.label(r["caption"]).classes("text-body2")
+            with ui.row().classes("gap-1 q-mt-xs"):
+                ui.badge(r["activity"]).props("color=primary")
+                ui.badge(r["location"]).props("color=secondary")
+                if r["status"] != "ai":
+                    ui.badge(r["status"]).props(f"color={STATUS_COLOR[r['status']]}")
+
+
+def open_big(photo_id):
+    with ui.dialog() as big, ui.card().classes("q-pa-none").style("max-width:95vw"):
+        ui.image(f"/photo/{photo_id}/large").props("fit=contain").style("width:90vw;height:85vh")
+    big.open()
+
+
+@ui.page("/")
+def index(person: str = "", location: str = ""):
+    layout("/")
+    state = {"pivot": None, "selected": None, "rows": [], "page": 1, "person": person}
+    facets = engine.facets()
 
     with ui.column().classes("w-full q-pa-lg gap-3"):
         with ui.row().classes("w-full items-center gap-2 no-wrap"):
@@ -144,6 +216,7 @@ def index():
             f_activity = ui.select(facets["activity"], label="Event / activity", clearable=True,
                                    on_change=lambda: run_search()).classes("w-48")
             f_location = ui.select(facets["location"], label="Location", clearable=True,
+                                   value=location if location in facets["location"] else None,
                                    on_change=lambda: run_search()).classes("w-44")
             f_attribute = ui.select(facets["attribute"], label="Person attribute", clearable=True,
                                     on_change=lambda: run_search()).classes("w-48")
@@ -154,8 +227,7 @@ def index():
             status = ui.label().classes("text-grey-8")
             pager_top = ui.row()
         pivot_bar = ui.row().classes("items-center gap-2")
-        grid = ui.element("div").classes("w-full").style(
-            "display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px")
+        grid = ui.element("div").classes("w-full").style(GRID)
         pager_bottom = ui.row().classes("w-full justify-center")
 
     # fixed: the panel stays on screen while the photo grid scrolls
@@ -168,13 +240,21 @@ def index():
 
     def filters():
         return {"activity": f_activity.value, "location": f_location.value,
-                "attribute": f_attribute.value, "year": f_year.value}
+                "attribute": f_attribute.value, "year": f_year.value, "person": state["person"]}
+
+    def clear_person():
+        state["person"] = ""
+        run_search()
 
     def run_search():
         state["pivot"] = None
         hits, took = engine.search(search_box.value or "", filters(), top=len(engine.rows))
         status.text = f"{len(hits)} photos in {took * 1000:.0f} ms"
         pivot_bar.clear()
+        if state["person"]:
+            with pivot_bar:
+                ui.chip(f"Person {state['person']}", icon="face", removable=True,
+                        on_value_change=clear_person).props("color=secondary text-color=white")
         show([r for r, _, _ in hits])
 
     def run_pivot(photo_id, kind):
@@ -183,7 +263,7 @@ def index():
         r = engine.rows[photo_id]
         label = {"event": f"same event ({r['event_name']}, {r['event_id']})",
                  "location": f"same location ({r['location']})",
-                 "person": f"same person attributes ({r['person_attributes'].replace(';', ', ')})"}[kind]
+                 "person": "same person"}[kind]
         status.text = f"{len(rows)} photos with the {label}"
         pivot_bar.clear()
         with pivot_bar:
@@ -215,16 +295,7 @@ def index():
             if not rows:
                 ui.label("No photos match. Try fewer words or clear a filter.").classes("text-grey-7")
             for r in rows[start : start + PAGE_SIZE]:
-                with ui.card().tight().classes("cursor-pointer").on("click", lambda r=r: open_detail(r["id"])):
-                    ui.image(f"/photo/{r['id']}/thumb").classes("h-40").props("fit=cover")
-                    with ui.card_section().classes("q-pa-sm"):
-                        ui.label(f"Photo {r['id']}").classes("text-caption text-grey-7")
-                        ui.label(r["caption"]).classes("text-body2")
-                        with ui.row().classes("gap-1 q-mt-xs"):
-                            ui.badge(r["activity"]).props("color=primary")
-                            ui.badge(r["location"]).props("color=secondary")
-                            if r["status"] != "ai":
-                                ui.badge(r["status"]).props(f"color={STATUS_COLOR[r['status']]}")
+                photo_card(r, open_detail)
 
     def open_detail(photo_id):
         r = engine.rows[photo_id]
@@ -237,6 +308,7 @@ def index():
             ui.label("Click the photo to enlarge it").classes("text-caption text-grey-7")
             with ui.row().classes("items-center gap-2"):
                 ui.label(f"Photo {photo_id}").classes("text-subtitle2")
+                star_button(photo_id)
                 ui.badge("AI suggestion" if r["status"] == "ai" else f"staff {r['status']}").props(
                     f"color={STATUS_COLOR[r['status']]}")
                 if r["taken"]:
@@ -246,10 +318,16 @@ def index():
             with ui.row().classes("gap-2"):
                 ui.button("Same event", icon="event", on_click=lambda: run_pivot(photo_id, "event")).props("outline dense")
                 ui.button("Same location", icon="place", on_click=lambda: run_pivot(photo_id, "location")).props("outline dense")
-                ui.button("Same person", icon="checkroom", on_click=lambda: run_pivot(photo_id, "person")).props("outline dense")
-            people = r.get("person_ids", "").replace(";", ", ")
-            ui.label(f"Person groups in this photo: {people}" if people else "No person group (no clear face)").classes(
-                "text-caption")
+                ui.button("Same person", icon="face", on_click=lambda: run_pivot(photo_id, "person")).props("outline dense")
+            people = [p for p in r.get("person_ids", "").split(";") if p]
+            if people:
+                with ui.row().classes("items-center gap-2"):
+                    ui.label("People in this photo:").classes("text-caption")
+                    for p in people:
+                        ui.chip(p, icon="face", on_click=lambda p=p: ui.navigate.to(f"/?person={p}")).props(
+                            "dense outline clickable")
+            else:
+                ui.label("No person group (no clear face)").classes("text-caption")
             ui.label("Same person uses anonymous face groups first, then clothing. No names.").classes(
                 "text-caption text-grey-7")
 
@@ -291,14 +369,74 @@ def index():
     run_search()
 
 
+@ui.page("/people")
+def people_page():
+    layout("/people")
+    counts = {}
+    for r in engine.rows:
+        for p in r.get("person_ids", "").split(";"):
+            if p:
+                counts[p] = counts.get(p, 0) + 1
+    with ui.column().classes("w-full q-pa-lg gap-3"):
+        ui.label("People").classes("text-h5")
+        ui.label("Anonymous groups made from faces (P01, P02...). No names and no identity lookup. "
+                 "Click a person to see every photo they are in.").classes("text-grey-7")
+        if not counts:
+            ui.label("No person groups yet. Run python pipeline.py to create them.").classes("text-grey-7")
+        with ui.element("div").classes("w-full").style(
+                "display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:20px"):
+            for p, n in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
+                with ui.column().classes("items-center cursor-pointer").on(
+                        "click", lambda p=p: ui.navigate.to(f"/?person={p}")):
+                    ui.image(f"/face/{p}").classes("rounded-full").style("width:130px;height:130px").props("fit=cover")
+                    ui.label(p).classes("text-weight-bold")
+                    ui.label(f"{n} photos").classes("text-caption text-grey-7")
+
+
+@ui.page("/places")
+def places_page():
+    layout("/places")
+    places = {}
+    for r in engine.rows:
+        places.setdefault(r["location"], []).append(r)
+    with ui.column().classes("w-full q-pa-lg gap-3"):
+        ui.label("Places").classes("text-h5")
+        ui.label("Where the photos were taken, as recognized by the AI. Click a place to see its photos.").classes(
+            "text-grey-7")
+        with ui.element("div").classes("w-full").style(
+                "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px"):
+            for place, rows in sorted(places.items(), key=lambda x: -len(x[1])):
+                cover = max(rows, key=lambda r: r["location_conf"])
+                with ui.card().tight().classes("cursor-pointer relative").on(
+                        "click", lambda place=place: ui.navigate.to(f"/?location={place}")):
+                    ui.image(f"/photo/{cover['id']}/thumb").classes("h-48").props("fit=cover")
+                    with ui.element("div").classes("absolute-bottom q-pa-sm").style(
+                            "background:linear-gradient(transparent,rgba(0,0,0,.7))"):
+                        ui.label(place.capitalize()).classes("text-white text-weight-bold")
+                        ui.label(f"{len(rows)} photos").classes("text-white text-caption")
+
+
+@ui.page("/favorites")
+def favorites_page():
+    layout("/favorites")
+    with ui.column().classes("w-full q-pa-lg gap-3"):
+        ui.label("Favorites").classes("text-h5")
+        ui.label("Click the star on any photo to add it here. For now favorites are kept until the app "
+                 "restarts, saving them comes later.").classes("text-grey-7")
+        with ui.element("div").classes("w-full").style(GRID):
+            favs = [engine.rows[i] for i in sorted(FAVORITES)]
+            if not favs:
+                ui.label("No favorites yet.").classes("text-grey-7")
+            for r in favs:
+                photo_card(r, open_big)
+
+
 @ui.page("/log")
 def log_page():
-    ui.colors(primary="#24214f", secondary="#b9770e")
-    with ui.header().classes("items-center bg-primary q-px-lg"):
-        ui.link("Spotlight AI", "/").classes("text-white text-h6 text-weight-bold")
-        ui.label("Review log").classes("text-caption opacity-80")
+    layout("/log")
     with ui.column().classes("w-full q-pa-lg"):
-        ui.label("Every accept and edit by staff, newest first").classes("text-h6")
+        ui.label("Review log").classes("text-h5")
+        ui.label("Every accept and edit by staff, newest first").classes("text-grey-7")
         rows = [{"time": e["time"], "photo": e["photo_id"], "decision": e["decision"], "reviewer": e["reviewer"],
                  "changed": ", ".join(f"{k}: {e['before'][k]} → {v}" for k, v in e["after"].items()) or "-",
                  "note": e["note"]} for e in engine.audit_log(200)]
