@@ -85,7 +85,7 @@ def api_audit(last: int = 50):
 def api_export():
     """The structured output file: one row per photo with event, location and attributes."""
     buf = io.StringIO()
-    fields = ["id", "file", "caption", "activity", "location", "person_attributes", "event_id", "event_name", "taken", "status"]
+    fields = ["id", "file", "caption", "activity", "location", "person_attributes", "objects", "event_id", "event_name", "taken", "status"]
     writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
     writer.writerows(engine.rows)
@@ -101,11 +101,22 @@ def public(r):
 # Screens (NiceGUI)
 
 STATUS_COLOR = {"ai": "grey", "accepted": "positive", "edited": "primary"}
+PAGE_SIZE = 24
+
+
+def confirm(question, action):
+    """Small yes/no box so one accidental click does not change a record."""
+    with ui.dialog() as dlg, ui.card():
+        ui.label(question)
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=dlg.close).props("flat")
+            ui.button("Yes", on_click=lambda: (dlg.close(), action())).props("unelevated color=primary")
+    dlg.open()
 
 
 @ui.page("/")
 def index():
-    state = {"query": "", "pivot": None, "selected": None}
+    state = {"query": "", "pivot": None, "selected": None, "rows": [], "page": 1}
     facets = engine.facets()
 
     ui.colors(primary="#24214f", secondary="#b9770e", accent="#b9770e")
@@ -139,12 +150,16 @@ def index():
             f_year = ui.select(facets["year"], label="Year", clearable=True,
                                on_change=lambda: run_search()).classes("w-28")
 
-        status = ui.label().classes("text-grey-8")
+        with ui.row().classes("w-full items-center justify-between"):
+            status = ui.label().classes("text-grey-8")
+            pager_top = ui.row()
         pivot_bar = ui.row().classes("items-center gap-2")
         grid = ui.element("div").classes("w-full").style(
             "display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px")
+        pager_bottom = ui.row().classes("w-full justify-center")
 
-    with ui.right_drawer(value=False, fixed=False).props("width=420 bordered").classes("bg-white q-pa-md") as drawer:
+    # fixed: the panel stays on screen while the photo grid scrolls
+    with ui.right_drawer(value=False, fixed=True).props("width=420 bordered").classes("bg-white q-pa-md") as drawer:
         detail = ui.column().classes("w-full gap-2")
 
     def set_query(text):
@@ -157,7 +172,7 @@ def index():
 
     def run_search():
         state["pivot"] = None
-        hits, took = engine.search(search_box.value or "", filters())
+        hits, took = engine.search(search_box.value or "", filters(), top=len(engine.rows))
         status.text = f"{len(hits)} photos in {took * 1000:.0f} ms"
         pivot_bar.clear()
         show([r for r, _, _ in hits])
@@ -177,11 +192,29 @@ def index():
         show([r] + rows)
 
     def show(rows):
+        state["rows"] = rows
+        state["page"] = 1
+        render_page()
+
+    def go_to(page):
+        state["page"] = page
+        render_page()
+
+    def render_page():
+        rows = state["rows"]
+        pages = max(1, -(-len(rows) // PAGE_SIZE))
+        start = (state["page"] - 1) * PAGE_SIZE
+        for pager in (pager_top, pager_bottom):
+            pager.clear()
+            if pages > 1:
+                with pager:
+                    ui.pagination(1, pages, direction_links=True, value=state["page"],
+                                  on_change=lambda e: go_to(e.value)).props("boundary-links max-pages=7")
         grid.clear()
         with grid:
             if not rows:
                 ui.label("No photos match. Try fewer words or clear a filter.").classes("text-grey-7")
-            for r in rows:
+            for r in rows[start : start + PAGE_SIZE]:
                 with ui.card().tight().classes("cursor-pointer").on("click", lambda r=r: open_detail(r["id"])):
                     ui.image(f"/photo/{r['id']}/thumb").classes("h-40").props("fit=cover")
                     with ui.card_section().classes("q-pa-sm"):
@@ -198,7 +231,10 @@ def index():
         state["selected"] = photo_id
         detail.clear()
         with detail:
-            ui.image(f"/photo/{photo_id}/large").classes("w-full rounded-borders")
+            with ui.dialog() as big, ui.card().classes("q-pa-none").style("max-width:95vw"):
+                ui.image(f"/photo/{photo_id}/large").props("fit=contain").style("width:90vw;height:85vh")
+            ui.image(f"/photo/{photo_id}/large").classes("w-full rounded-borders cursor-pointer").on("click", big.open)
+            ui.label("Click the photo to enlarge it").classes("text-caption text-grey-7")
             with ui.row().classes("items-center gap-2"):
                 ui.label(f"Photo {photo_id}").classes("text-subtitle2")
                 ui.badge("AI suggestion" if r["status"] == "ai" else f"staff {r['status']}").props(
@@ -213,7 +249,9 @@ def index():
                 ui.button("Same person", icon="checkroom", on_click=lambda: run_pivot(photo_id, "person")).props("outline dense")
             ui.label("Same person uses clothing and gear only, never faces.").classes("text-caption text-grey-7")
 
-            ui.label("Record").classes("text-overline q-mt-sm")
+            ui.label("AI description").classes("text-overline q-mt-sm")
+            ui.label("You edit the text that describes the photo. The photo itself is never changed.").classes(
+                "text-caption text-grey-7")
             caption = ui.textarea("Caption", value=r["caption"]).props("outlined dense autogrow").classes("w-full")
             activity = ui.select(sorted(set(facets["activity"]) | {r["activity"]}), value=r["activity"],
                                  label=f"Event / activity (AI {r['activity_conf']:.0%})", new_value_mode="add-unique").classes("w-full")
@@ -222,11 +260,12 @@ def index():
             attrs = ui.select(facets["attribute"], value=[a for a in r["person_attributes"].split(";") if a],
                               label="Person attributes", multiple=True, new_value_mode="add-unique").props(
                 "use-chips").classes("w-full")
+            objects = ui.input("Visible objects (separated by ;)", value=r.get("objects", "")).props("dense").classes("w-full")
             note = ui.input("Note (optional)").props("dense").classes("w-full")
 
             def save(decision):
                 changes = {"caption": caption.value, "activity": activity.value, "location": location.value,
-                           "person_attributes": ";".join(attrs.value or [])}
+                           "person_attributes": ";".join(attrs.value or []), "objects": objects.value or ""}
                 entry = engine.review(photo_id, decision, changes, note=note.value or "")
                 ui.notify(f"Saved as {entry['decision']}", type="positive")
                 open_detail(photo_id)
@@ -236,8 +275,12 @@ def index():
                     run_search()
 
             with ui.row().classes("gap-2"):
-                ui.button("Accept", icon="check", on_click=lambda: save("accepted")).props("unelevated color=positive")
-                ui.button("Save edits", icon="edit", on_click=lambda: save("edited")).props("unelevated color=primary")
+                ui.button("Accept description", icon="check", on_click=lambda: confirm(
+                    f"Mark the AI description of photo {photo_id} as correct?", lambda: save("accepted"))).props(
+                    "unelevated color=positive")
+                ui.button("Save my changes", icon="edit", on_click=lambda: confirm(
+                    f"Save your changes to the description of photo {photo_id}?", lambda: save("edited"))).props(
+                    "unelevated color=primary")
         drawer.show()
 
     search_box.on("keydown.enter", lambda: run_search())
@@ -260,4 +303,4 @@ def log_page():
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(host="127.0.0.1", port=8080, title="Spotlight AI", reload=False, show=False)
+    ui.run(host="127.0.0.1", port=8080, title="Spotlight AI", reload=False, show=False, fastapi_docs=True)

@@ -25,7 +25,7 @@ OUT = ROOT / "outputs"
 CLIP_NAME = "openai/clip-vit-base-patch32"
 TEXT_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 RRF_K = 60  # standard constant for Reciprocal Rank Fusion
-EDITABLE = {"caption", "activity", "location", "person_attributes"}
+EDITABLE = {"caption", "activity", "location", "person_attributes", "objects"}
 
 
 def tokenize(text):
@@ -57,7 +57,8 @@ class BM25:
 
 def search_text(r):
     attrs = r["person_attributes"].replace(";", ", ")
-    return f"{r['caption']}. {r['activity']} at {r['location']}. {attrs}"
+    objects = r.get("objects", "").replace(";", ", ")
+    return f"{r['caption']}. {r['activity']} at {r['location']}. {attrs}. {objects}"
 
 
 class SearchEngine:
@@ -148,11 +149,19 @@ class SearchEngine:
             same.sort(key=lambda x: -float(self.clip_emb[x["id"]] @ self.clip_emb[photo_id]))
             return same[:top]
         if kind == "person":
-            if not r["person_attributes"]:
+            # At least 2 shared clothing items, ranked by Jaccard (shared / all). One shared
+            # item like "blue top" matches half the archive, so it is not enough.
+            mine = set(r["person_attributes"].split(";")) - {""}
+            if len(mine) < 2:
                 return []
-            sims = self.attr_emb @ self.attr_emb[photo_id]
-            order = [i for i in np.argsort(-sims) if i != photo_id and sims[i] > 0.6]
-            return [self.rows[i] for i in order[:top]]
+            scored = []
+            for x in self.rows:
+                theirs = set(x["person_attributes"].split(";")) - {""}
+                shared = mine & theirs
+                if x["id"] != photo_id and len(shared) >= 2:
+                    scored.append((len(shared) / len(mine | theirs), x))
+            scored.sort(key=lambda t: -t[0])
+            return [x for _, x in scored[:top]]
         raise ValueError(kind)
 
     # Staff review
@@ -168,13 +177,13 @@ class SearchEngine:
     def review(self, photo_id, decision, changes=None, reviewer="staff", note=""):
         """decision: accepted or edited. Saves the record and appends to the audit log."""
         r = self.rows[photo_id]
-        changes = {k: v for k, v in (changes or {}).items() if k in EDITABLE and v != r[k]}
+        changes = {k: v for k, v in (changes or {}).items() if k in EDITABLE and v != r.get(k, "")}
         entry = {
             "time": datetime.now().isoformat(timespec="seconds"),
             "photo_id": photo_id,
             "decision": "edited" if changes else decision,
             "reviewer": reviewer,
-            "before": {k: r[k] for k in changes},
+            "before": {k: r.get(k, "") for k in changes},
             "after": changes,
             "note": note,
         }

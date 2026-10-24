@@ -1,18 +1,20 @@
 """Read every photo once and save a structured record per photo to outputs/.
 
 For each photo: a caption, the event/activity, the location, non-biometric person
-attributes (clothing and gear), an event group, plus embeddings for search.
+attributes (clothing and gear), visible objects, an event group, plus embeddings for search.
 The search app reads outputs/ so searching is instant. Run again when new photos are added.
 
-    python pipeline.py                  # all photos in data/raw
-    python pipeline.py --limit 20       # quick test on 20 photos
+    python pipeline.py                      # all photos, captions by Qwen2.5-VL
+    python pipeline.py --limit 20           # quick test on 20 photos
+    python pipeline.py --captioner blip     # older, faster BLIP captions
 
 No face detection, face crops or face embeddings are made anywhere. "Same person"
-in the app is matched on the attribute text only.
+in the app is matched on clothing and gear only.
 """
 import argparse
 import csv
 import json
+import re
 import time
 from collections import Counter
 from datetime import datetime
@@ -23,8 +25,9 @@ import torch
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from sklearn.cluster import AgglomerativeClustering
-from transformers import (AutoModel, AutoTokenizer, BlipForConditionalGeneration, BlipProcessor,
-                          CLIPModel, CLIPProcessor)
+from transformers import (AutoModel, AutoProcessor, AutoTokenizer, BitsAndBytesConfig,
+                          BlipForConditionalGeneration, BlipProcessor, CLIPModel, CLIPProcessor,
+                          Qwen2_5_VLForConditionalGeneration)
 
 register_heif_opener()
 
@@ -35,38 +38,42 @@ EXTS = {".jpg", ".jpeg", ".png", ".heic"}
 
 CLIP_NAME = "openai/clip-vit-base-patch32"
 BLIP_NAME = "Salesforce/blip-image-captioning-large"
+QWEN_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
 TEXT_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-# Label lists scored with CLIP. Change them after talking to DCT, they should match
-# the words staff use. Key = label shown in the app, value = prompt given to CLIP.
+# Label lists. Key = label shown in the app, value = sentence CLIP compares with the photo.
+# Qwen picks from the same keys, so both models use one vocabulary. Change them with DCT.
 ACTIVITIES = {
-    "birthday party": "a birthday party with a cake",
-    "shopping spree": "children shopping in a store with bags",
-    "theme park visit": "a family visiting a theme park",
-    "meeting a character": "a child meeting a costumed character or mascot",
-    "photo session": "a posed photo session in front of a backdrop",
-    "gift giving": "a child receiving a gift",
-    "fundraiser or gala": "people at a fundraising gala event",
-    "run or sports event": "people at a charity run or sports event",
-    "holiday party": "a holiday party with decorations",
-    "family time": "a family relaxing together",
-    "staff and volunteers": "volunteers or staff working together in matching shirts",
+    "birthday party": "a photo of a birthday party with a cake",
+    "shopping spree": "a photo of children shopping in a store with bags",
+    "theme park visit": "a photo of a family visiting a theme park",
+    "meeting a character": "a photo of a child meeting a costumed character or mascot",
+    "photo session": "a posed group photo in front of a backdrop",
+    "gift giving": "a photo of a child receiving a gift",
+    "fundraiser or gala": "a photo of people at a fundraising gala event",
+    "run or sports event": "a photo of people at a charity run or sports event",
+    "holiday party": "a photo of a holiday party with decorations",
+    "meal together": "a photo of people eating a meal together at a table",
+    "staff and volunteers": "a photo of volunteers or staff working together in matching shirts",
 }
 LOCATIONS = {
-    "theme park": "a theme park",
-    "store": "inside a store",
-    "restaurant": "inside a restaurant",
-    "hotel or resort": "a hotel or resort",
-    "hospital": "a hospital room",
-    "home": "inside a home",
-    "park or outdoors": "an outdoor park with grass and trees",
-    "beach": "a beach",
-    "event hall": "an event hall or ballroom",
-    "office": "an office",
-    "studio backdrop": "a photo studio with a plain backdrop",
+    "theme park": "a photo taken at a theme park",
+    "store": "a photo taken inside a store",
+    "restaurant": "a photo taken inside a restaurant",
+    "hotel or resort": "a photo taken at a hotel or resort",
+    "hospital": "a photo taken in a hospital room",
+    "meeting room or office": "a photo taken in a meeting room or office with a table and chairs",
+    "living room": "a photo taken in a living room with a sofa",
+    "playroom or arcade": "a photo taken in a playroom or game arcade",
+    "park or outdoors": "a photo taken outdoors with grass and trees",
+    "beach": "a photo taken at a beach",
+    "event hall or gym": "a photo taken in an event hall, ballroom or gym",
+    "stage": "a photo of people on a stage at an event",
+    "photo backdrop": "a posed photo in front of a plain photo backdrop",
 }
-# Only clothing and gear, never faces, skin, age or gender
-ATTRIBUTES = {
+# What a person wears or uses. Only these are used for "Same person", never faces,
+# skin, age or gender. Objects like toys or bags are kept separately in "objects".
+CLOTHING = {
     "mouse ears hat": "a person wearing mouse ears",
     "cap or hat": "a person wearing a cap or hat",
     "glasses": "a person wearing glasses",
@@ -75,21 +82,46 @@ ATTRIBUTES = {
     "red top": "a person wearing a red shirt",
     "blue top": "a person wearing a blue shirt",
     "pink top": "a person wearing a pink shirt",
+    "purple top": "a person wearing a purple shirt",
     "white top": "a person wearing a white shirt",
     "black top": "a person wearing a black shirt",
+    "gray top": "a person wearing a gray shirt",
     "yellow top": "a person wearing a yellow shirt",
     "green top": "a person wearing a green shirt",
+    "orange top": "a person wearing an orange shirt",
+    "striped top": "a person wearing a striped shirt",
+    "jersey": "a person wearing a sports jersey",
     "matching shirts": "a group wearing matching t-shirts",
     "backpack": "a person with a backpack",
     "wheelchair": "a person in a wheelchair",
     "stroller": "a child in a stroller",
-    "shopping bags": "a person holding shopping bags",
-    "balloons": "a person holding balloons",
-    "stuffed animal": "a child holding a stuffed animal",
 }
-ATTR_THRESHOLD = 0.23  # cosine similarity, tune on the test set
+ATTR_THRESHOLD = 0.23  # cosine similarity for the CLIP fallback, tune on the test set
 TOP_ATTRS = 3
 EVENT_DISTANCE = 0.18  # how different two undated photos can be and still count as one event
+SAME_SCENE = 0.90      # photos this similar in one event are the same scene and share labels
+
+QWEN_PROMPT = f"""Describe this event photo for a searchable photo archive of a children's charity.
+Answer with JSON only, in this form:
+{{"caption": "...", "activity": "...", "location": "...", "clothing": [...], "objects": [...]}}
+Rules:
+- caption: one plain sentence about what is clearly visible. Say "a child", "an adult" or "a group".
+  Never guess names, family relationships (mother, father, son, family), illness or feelings.
+- activity: exactly one of {list(ACTIVITIES)} or "other".
+- location: exactly one of {list(LOCATIONS)} or "other".
+- clothing: every item from this list that a person in the photo clearly wears or uses: {list(CLOTHING)}.
+  Use an empty list if you are not sure.
+- objects: up to 5 clearly visible objects. Leave out anything you are not sure about.
+  A person in a full animal costume is a "mascot", not a stuffed animal."""
+
+# BLIP and Qwen sometimes guess family roles. We do not know who people are, so captions stay neutral.
+RELATION_WORDS = {
+    "mother": "an adult", "mom": "an adult", "father": "an adult", "dad": "an adult",
+    "grandmother": "an adult", "grandfather": "an adult", "parents": "adults", "parent": "an adult",
+    "husband": "an adult", "wife": "an adult",
+    "son": "a child", "daughter": "a child", "brother": "a child", "sister": "a child",
+    "family": "a group",
+}
 
 
 def features(out):
@@ -100,10 +132,14 @@ def features(out):
 
 
 def clean_caption(cap):
-    cap = cap.strip()
+    cap = cap.strip().rstrip(".")
     for start in ("there is ", "there are ", "arafed ", "araffe "):
-        if cap.startswith(start):
+        if cap.lower().startswith(start):
             cap = cap[len(start):]
+    # "family" used as an adjective ("a family dinner") is just dropped
+    cap = re.sub(r"\bfamily (?=party|photo|picture|dinner|meal|time|gathering|trip|vacation)", "", cap, flags=re.IGNORECASE)
+    for word, neutral in RELATION_WORDS.items():
+        cap = re.sub(rf"\b(?:(?:a|an|the|her|his|their) )?{word}\b", neutral, cap, flags=re.IGNORECASE)
     return cap[:1].upper() + cap[1:]
 
 
@@ -131,16 +167,12 @@ def clip_text(clip, proc, prompts, device):
         return features(clip.get_text_features(**t))
 
 
-def best_label(sim, labels):
-    """Single label with a confidence from a softmax over all labels."""
-    probs = torch.softmax(torch.tensor(sim) * 100, dim=0).numpy()
-    i = int(probs.argmax())
-    return labels[i], float(probs[i])
+def label_probs(sim):
+    """Softmax over all labels, so the scores add up to 1 and read as a confidence."""
+    return torch.softmax(torch.tensor(sim) * 100, dim=0).numpy()
 
 
-def text_embed(texts, device):
-    tok = AutoTokenizer.from_pretrained(TEXT_NAME)
-    model = AutoModel.from_pretrained(TEXT_NAME).to(device).eval()
+def text_embed(texts, tok, model, device):
     out = []
     with torch.no_grad():
         for i in range(0, len(texts), 64):
@@ -151,6 +183,55 @@ def text_embed(texts, device):
             out.append(torch.nn.functional.normalize(e, dim=-1).cpu().numpy())
     return np.concatenate(out)
 
+
+# Captions
+
+def parse_json(answer):
+    match = re.search(r"\{.*\}", answer, re.DOTALL)
+    try:
+        return json.loads(match.group(0)) if match else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def describe_with_qwen(files):
+    """One structured description per photo. Runs alone on the GPU, then frees it."""
+    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(QWEN_NAME, quantization_config=quant, device_map="cuda")
+    proc = AutoProcessor.from_pretrained(QWEN_NAME, min_pixels=128 * 28 * 28, max_pixels=400 * 28 * 28)
+    messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": QWEN_PROMPT}]}]
+    prompt = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    results = []
+    for n, path in enumerate(files, 1):
+        inputs = proc(text=[prompt], images=[load_image(path, 896)], return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=200, do_sample=False)
+        answer = proc.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+        results.append(parse_json(answer))
+        print(f"  Qwen {n}/{len(files)}", flush=True)
+
+    del model
+    torch.cuda.empty_cache()
+    return results
+
+
+def caption_with_blip(images, blip, blip_proc, dtype):
+    b = blip_proc(images=images, return_tensors="pt").to(blip.device)
+    ids = blip.generate(pixel_values=b["pixel_values"].to(dtype), max_new_tokens=30, num_beams=3)
+    return blip_proc.batch_decode(ids, skip_special_tokens=True)
+
+
+def pick(qwen_value, choices, probs):
+    """Qwen's label if it is one of ours, else CLIP's best. Confidence is CLIP's score for that label."""
+    labels = list(choices)
+    if qwen_value in choices:
+        return qwen_value, float(probs[labels.index(qwen_value)])
+    i = int(probs.argmax())
+    return labels[i], float(probs[i])
+
+
+# Events
 
 def group_events(rows, img_emb):
     """Same day = same event. Undated photos are grouped by how similar they look."""
@@ -175,10 +256,26 @@ def group_events(rows, img_emb):
             rows[i]["event_name"] = name
 
 
+def harmonize_scenes(rows, img_emb):
+    """Photos of the same scene (same event, almost the same picture) get the same location
+    and activity, decided by a majority vote. Stops one room getting two different labels."""
+    before = [(r["location"], r["activity"]) for r in rows]
+    for r in rows:
+        same = [x["id"] for x in rows if x["event_id"] == r["event_id"]
+                and float(img_emb[x["id"]] @ img_emb[r["id"]]) >= SAME_SCENE]
+        if len(same) < 2:
+            continue
+        for k, field in enumerate(("location", "activity")):
+            votes = Counter(before[i][k] for i in same).most_common()
+            if votes[0][1] > len(same) / 2:
+                r[field] = votes[0][0]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=0, help="only the first N photos")
     parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--captioner", choices=["qwen", "blip"], default="qwen")
     args = parser.parse_args()
 
     files = sorted(p for p in DATA.iterdir() if p.suffix.lower() in EXTS)
@@ -190,19 +287,27 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
-    print(f"{len(files)} photos, device {device}")
+    print(f"{len(files)} photos, device {device}, captions by {args.captioner}")
+    start = time.time()
 
+    # Pass 1: Qwen describes every photo (it needs most of the GPU, so it runs first and alone)
+    use_qwen = args.captioner == "qwen" and device == "cuda"
+    described = describe_with_qwen(files) if use_qwen else [{} for _ in files]
+
+    # Pass 2: CLIP embeddings and label scores (and BLIP captions when Qwen is not used)
     clip = CLIPModel.from_pretrained(CLIP_NAME, torch_dtype=dtype).to(device).eval()
     clip_proc = CLIPProcessor.from_pretrained(CLIP_NAME)
-    blip = BlipForConditionalGeneration.from_pretrained(BLIP_NAME, torch_dtype=dtype).to(device).eval()
-    blip_proc = BlipProcessor.from_pretrained(BLIP_NAME)
+    if not use_qwen:
+        blip = BlipForConditionalGeneration.from_pretrained(BLIP_NAME, torch_dtype=dtype).to(device).eval()
+        blip_proc = BlipProcessor.from_pretrained(BLIP_NAME)
+    text_tok = AutoTokenizer.from_pretrained(TEXT_NAME)
+    text_model = AutoModel.from_pretrained(TEXT_NAME).to(device).eval()
 
     act_emb = clip_text(clip, clip_proc, list(ACTIVITIES.values()), device)
     loc_emb = clip_text(clip, clip_proc, list(LOCATIONS.values()), device)
-    attr_emb = clip_text(clip, clip_proc, list(ATTRIBUTES.values()), device)
+    cloth_emb = clip_text(clip, clip_proc, list(CLOTHING.values()), device)
 
     rows, embeddings = [], []
-    start = time.time()
     for i in range(0, len(files), args.batch):
         batch = files[i : i + args.batch]
         images = [load_image(p) for p in batch]
@@ -212,44 +317,48 @@ def main():
             img_emb = features(clip.get_image_features(pixel_values=c["pixel_values"].to(dtype)))
             act_sim = (img_emb @ act_emb.T).float().cpu().numpy()
             loc_sim = (img_emb @ loc_emb.T).float().cpu().numpy()
-            attr_sim = (img_emb @ attr_emb.T).float().cpu().numpy()
+            cloth_sim = (img_emb @ cloth_emb.T).float().cpu().numpy()
+            blip_caps = caption_with_blip(images, blip, blip_proc, dtype) if not use_qwen else [""] * len(batch)
 
-            b = blip_proc(images=images, return_tensors="pt").to(device)
-            ids = blip.generate(pixel_values=b["pixel_values"].to(dtype), max_new_tokens=30, num_beams=3)
-            captions = blip_proc.batch_decode(ids, skip_special_tokens=True)
-
-        for k, (path, img, cap) in enumerate(zip(batch, images, captions)):
-            activity, act_conf = best_label(act_sim[k], list(ACTIVITIES))
-            location, loc_conf = best_label(loc_sim[k], list(LOCATIONS))
-            best = sorted(zip(attr_sim[k], ATTRIBUTES), reverse=True)[:TOP_ATTRS]
-            attrs = [name for s, name in best if s >= ATTR_THRESHOLD]
+        for k, (path, img) in enumerate(zip(batch, images)):
+            d = described[len(rows)]
+            activity, act_conf = pick(d.get("activity"), ACTIVITIES, label_probs(act_sim[k]))
+            location, loc_conf = pick(d.get("location"), LOCATIONS, label_probs(loc_sim[k]))
+            if use_qwen:
+                clothing = list(dict.fromkeys(c for c in d.get("clothing", []) if c in CLOTHING))
+            else:
+                best = sorted(zip(cloth_sim[k], CLOTHING), reverse=True)[:TOP_ATTRS]
+                clothing = [name for s, name in best if s >= ATTR_THRESHOLD]
+            objects = [str(o).strip().lower() for o in d.get("objects", [])][:5]
             when = taken_at(path)
             rows.append({
                 "id": len(rows),
                 "file": path.name,
-                "caption": clean_caption(cap),
+                "caption": clean_caption(d.get("caption") or blip_caps[k] or "No description"),
                 "activity": activity,
                 "activity_conf": round(act_conf, 2),
                 "location": location,
                 "location_conf": round(loc_conf, 2),
-                "person_attributes": ";".join(attrs),
+                "person_attributes": ";".join(clothing),
+                "objects": ";".join(objects),
                 "taken": when.isoformat(sep=" ") if when else "",
                 "orientation": "portrait" if img.height > img.width else "landscape",
                 "status": "ai",  # ai, accepted or edited, changed by staff in the app
             })
         embeddings.append(img_emb.float().cpu().numpy())
-        print(f"  {min(i + args.batch, len(files))}/{len(files)}")
+        print(f"  CLIP {min(i + args.batch, len(files))}/{len(files)}")
 
     img_all = np.concatenate(embeddings)
     group_events(rows, img_all)
+    harmonize_scenes(rows, img_all)
 
-    # Text embeddings: one for full search, one for the attributes only (same-person pivot)
-    search_text = [f"{r['caption']}. {r['activity']} at {r['location']}. {r['person_attributes'].replace(';', ', ')}"
-                   for r in rows]
+    # Text embeddings: one for full search, one for the clothing only (same-person pivot)
+    search_text = [f"{r['caption']}. {r['activity']} at {r['location']}. "
+                   f"{r['person_attributes'].replace(';', ', ')}. {r['objects'].replace(';', ', ')}" for r in rows]
     attr_text = [r["person_attributes"].replace(";", ", ") or "no visible attributes" for r in rows]
     np.save(OUT / "clip_embeddings.npy", img_all)
-    np.save(OUT / "text_embeddings.npy", text_embed(search_text, device))
-    np.save(OUT / "attr_embeddings.npy", text_embed(attr_text, device))
+    np.save(OUT / "text_embeddings.npy", text_embed(search_text, text_tok, text_model, device))
+    np.save(OUT / "attr_embeddings.npy", text_embed(attr_text, text_tok, text_model, device))
 
     with open(OUT / "photos.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
