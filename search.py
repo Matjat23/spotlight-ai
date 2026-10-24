@@ -149,19 +149,24 @@ class SearchEngine:
             same.sort(key=lambda x: -float(self.clip_emb[x["id"]] @ self.clip_emb[photo_id]))
             return same[:top]
         if kind == "person":
-            # At least 2 shared clothing items, ranked by Jaccard (shared / all). One shared
-            # item like "blue top" matches half the archive, so it is not enough.
+            # 1. Face groups: photos that share an anonymous person group (P01...) come first
+            groups = set(r.get("person_ids", "").split(";")) - {""}
+            by_face = [x for x in self.rows if x["id"] != photo_id
+                       and groups & set(x.get("person_ids", "").split(";"))]
+            # 2. Clothing backup: at least 2 shared items, ranked by Jaccard (shared / all).
+            # One shared item like "blue top" matches half the archive, so it is not enough.
             mine = set(r["person_attributes"].split(";")) - {""}
             if len(mine) < 2:
-                return []
+                return by_face[:top]
+            seen = {x["id"] for x in by_face}
             scored = []
             for x in self.rows:
                 theirs = set(x["person_attributes"].split(";")) - {""}
                 shared = mine & theirs
-                if x["id"] != photo_id and len(shared) >= 2:
+                if x["id"] != photo_id and x["id"] not in seen and len(shared) >= 2:
                     scored.append((len(shared) / len(mine | theirs), x))
             scored.sort(key=lambda t: -t[0])
-            return [x for _, x in scored[:top]]
+            return (by_face + [x for _, x in scored])[:top]
         raise ValueError(kind)
 
     # Staff review

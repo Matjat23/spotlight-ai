@@ -8,8 +8,10 @@ The search app reads outputs/ so searching is instant. Run again when new photos
     python pipeline.py --limit 20           # quick test on 20 photos
     python pipeline.py --captioner blip     # older, faster BLIP captions
 
-No face detection, face crops or face embeddings are made anywhere. "Same person"
-in the app is matched on clothing and gear only.
+Face matching (approved by the organizers): faces are grouped into anonymous person
+groups (P01, P02...) so staff can find the same person in other photos. No names, no
+identity lookup, no face crops saved, and the face numbers are thrown away after grouping.
+Clothing and gear are the backup when no face is visible. Skip faces with --no-faces.
 """
 import argparse
 import csv
@@ -271,11 +273,60 @@ def harmonize_scenes(rows, img_emb):
                 r[field] = votes[0][0]
 
 
+# Faces
+
+FACE_MIN_SCORE = 0.6   # detector confidence, lower picks up mascot heads and blurry faces
+FACE_MIN_SIZE = 40     # pixels, smaller faces give unreliable numbers
+FACE_DISTANCE = 0.5    # cosine distance, average linkage. Looser values chain different people together
+
+
+def find_faces(files):
+    """For each face: (photo index, 512 normalized numbers from ArcFace). Nothing is saved."""
+    import onnxruntime  # noqa: F401  (loads before insightface so it finds the CUDA libraries from torch)
+    from insightface.app import FaceAnalysis
+
+    app = FaceAnalysis(name="buffalo_l", allowed_modules=["detection", "recognition"],
+                       providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    app.prepare(ctx_id=0, det_size=(640, 640))
+    faces = []
+    for n, path in enumerate(files):
+        img = np.array(load_image(path, 1280))[:, :, ::-1]  # RGB to BGR, what insightface expects
+        for f in app.get(img):
+            x1, y1, x2, y2 = f.bbox
+            if f.det_score >= FACE_MIN_SCORE and min(x2 - x1, y2 - y1) >= FACE_MIN_SIZE:
+                faces.append((n, f.normed_embedding))
+        if (n + 1) % 20 == 0 or n + 1 == len(files):
+            print(f"  Faces {n + 1}/{len(files)}", flush=True)
+    return faces
+
+
+def group_people(faces, count):
+    """Groups faces that look alike into P01, P02... Only people seen in 2+ photos get a group."""
+    people = [set() for _ in range(count)]
+    if len(faces) < 2:
+        return people
+    emb = np.stack([e for _, e in faces])
+    # Average linkage: a face joins a group only if it is close to the group on average. DBSCAN
+    # chained different people together (A looks like B, B like C) in our tests.
+    labels = AgglomerativeClustering(n_clusters=None, distance_threshold=FACE_DISTANCE,
+                                     metric="cosine", linkage="average").fit_predict(emb)
+    by_group = {}
+    for (photo, _), lab in zip(faces, labels):
+        if lab >= 0:
+            by_group.setdefault(lab, set()).add(photo)
+    groups = [photos for photos in by_group.values() if len(photos) >= 2]
+    for n, photos in enumerate(sorted(groups, key=len, reverse=True), 1):
+        for photo in photos:
+            people[photo].add(f"P{n:02d}")
+    return people
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=0, help="only the first N photos")
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--captioner", choices=["qwen", "blip"], default="qwen")
+    parser.add_argument("--no-faces", action="store_true", help="skip face grouping")
     args = parser.parse_args()
 
     files = sorted(p for p in DATA.iterdir() if p.suffix.lower() in EXTS)
@@ -294,7 +345,10 @@ def main():
     use_qwen = args.captioner == "qwen" and device == "cuda"
     described = describe_with_qwen(files) if use_qwen else [{} for _ in files]
 
-    # Pass 2: CLIP embeddings and label scores (and BLIP captions when Qwen is not used)
+    # Pass 2: anonymous person groups from faces
+    people = [set() for _ in files] if args.no_faces else group_people(find_faces(files), len(files))
+
+    # Pass 3: CLIP embeddings and label scores (and BLIP captions when Qwen is not used)
     clip = CLIPModel.from_pretrained(CLIP_NAME, torch_dtype=dtype).to(device).eval()
     clip_proc = CLIPProcessor.from_pretrained(CLIP_NAME)
     if not use_qwen:
@@ -343,6 +397,7 @@ def main():
                 "objects": ";".join(objects),
                 "taken": when.isoformat(sep=" ") if when else "",
                 "orientation": "portrait" if img.height > img.width else "landscape",
+                "person_ids": ";".join(sorted(people[len(rows)])),
                 "status": "ai",  # ai, accepted or edited, changed by staff in the app
             })
         embeddings.append(img_emb.float().cpu().numpy())

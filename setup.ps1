@@ -14,7 +14,7 @@ if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
     .\.venv\Scripts\python -m pip install torch torchvision
 }
 
-.\.venv\Scripts\python -m pip install transformers accelerate datasets pandas scikit-learn gradio opencv-python pillow pillow-heif nicegui bitsandbytes ultralytics einops timm sentencepiece matplotlib jupyter
+.\.venv\Scripts\python -m pip install transformers accelerate datasets pandas scikit-learn gradio opencv-python pillow pillow-heif nicegui bitsandbytes insightface "onnxruntime-gpu==1.22.0" ultralytics einops timm sentencepiece matplotlib jupyter
 
 .\.venv\Scripts\python -c "import torch; print('PyTorch', torch.__version__, '| GPU:', torch.cuda.is_available())"
 

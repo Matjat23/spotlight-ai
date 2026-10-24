@@ -85,7 +85,7 @@ def api_audit(last: int = 50):
 def api_export():
     """The structured output file: one row per photo with event, location and attributes."""
     buf = io.StringIO()
-    fields = ["id", "file", "caption", "activity", "location", "person_attributes", "objects", "event_id", "event_name", "taken", "status"]
+    fields = ["id", "file", "caption", "activity", "location", "person_attributes", "objects", "person_ids", "event_id", "event_name", "taken", "status"]
     writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
     writer.writerows(engine.rows)
@@ -247,7 +247,11 @@ def index():
                 ui.button("Same event", icon="event", on_click=lambda: run_pivot(photo_id, "event")).props("outline dense")
                 ui.button("Same location", icon="place", on_click=lambda: run_pivot(photo_id, "location")).props("outline dense")
                 ui.button("Same person", icon="checkroom", on_click=lambda: run_pivot(photo_id, "person")).props("outline dense")
-            ui.label("Same person uses clothing and gear only, never faces.").classes("text-caption text-grey-7")
+            people = r.get("person_ids", "").replace(";", ", ")
+            ui.label(f"Person groups in this photo: {people}" if people else "No person group (no clear face)").classes(
+                "text-caption")
+            ui.label("Same person uses anonymous face groups first, then clothing. No names.").classes(
+                "text-caption text-grey-7")
 
             ui.label("AI description").classes("text-overline q-mt-sm")
             ui.label("You edit the text that describes the photo. The photo itself is never changed.").classes(
