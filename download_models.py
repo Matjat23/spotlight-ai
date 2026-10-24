@@ -14,6 +14,8 @@ HF_MODELS = [
     "MCG-NJU/videomae-base-finetuned-kinetics",  # actions in video
     "trpakov/vit-face-expression",             # emotions from face crops
     "sentence-transformers/all-MiniLM-L6-v2",  # text embeddings
+    "Qwen/Qwen2.5-1.5B-Instruct",              # turns a search into text + filters
+    "Qwen/Qwen2.5-VL-3B-Instruct",             # structured captions: event, location, clothing
 ]
 
 # Skip formats we do not use (TensorFlow, Flax, ONNX) to save disk space
