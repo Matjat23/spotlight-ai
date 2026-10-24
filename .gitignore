@@ -47,8 +47,6 @@ outputs/
 *.pkl
 *.faiss
 
-# Notebook outputs can show photos, so notebooks stay local
-*.ipynb
 
 # Secrets and tokens
 .env

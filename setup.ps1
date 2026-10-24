@@ -14,10 +14,11 @@ if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
     .\.venv\Scripts\python -m pip install torch torchvision
 }
 
-.\.venv\Scripts\python -m pip install transformers accelerate datasets pandas scikit-learn gradio opencv-python pillow pillow-heif nicegui bitsandbytes insightface "onnxruntime-gpu==1.22.0" ultralytics einops timm sentencepiece matplotlib jupyter
+.\.venv\Scripts\python -m pip install transformers accelerate datasets pandas scikit-learn gradio opencv-python pillow pillow-heif nicegui nbstripout bitsandbytes insightface "onnxruntime-gpu==1.22.0" ultralytics einops timm sentencepiece matplotlib jupyter
 
 .\.venv\Scripts\python -c "import torch; print('PyTorch', torch.__version__, '| GPU:', torch.cuda.is_available())"
 
 .\.venv\Scripts\python download_models.py
 
 Write-Host "Done. Start working with: .venv\Scripts\activate  then  set HF_HUB_OFFLINE=1 (cmd) or `$env:HF_HUB_OFFLINE=1 (PowerShell)"
+.\.venv\Scripts\nbstripout --install --attributes .gitattributes  # notebooks are committed without outputs (photos stay local)

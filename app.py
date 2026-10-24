@@ -7,16 +7,20 @@ Runs only on this computer (127.0.0.1), photos never leave the laptop.
     python app.py           # then open http://127.0.0.1:8080
 """
 import csv
+import inspect
 import io
 import json
+import re
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
-from nicegui import app, ui
+from nicegui import app, run, ui
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 
+import pipeline
 from search import SearchEngine
 
 register_heif_opener()
@@ -58,7 +62,7 @@ def photo_file(photo_id: int, size: str):
 def face_cover(person: str):
     """Round cover for the People page: the clearest face of that person group, cut on the fly.
     Nothing is written to disk."""
-    faces = [f for f in FACES if f["person"] == person]
+    faces = [f for f in FACES if f["person"] == person and not engine.rows[f["photo"]].get("removed")]
     if not faces:
         raise HTTPException(404, "No face for that person group")
     best = max(faces, key=lambda f: f["score"] * (f["box"][2] - f["box"][0]))
@@ -126,10 +130,25 @@ def public(r):
 
 # Screens (NiceGUI)
 
+# Photos are numbered from 1 for people. Inside the code (and the /api) they count from 0.
 STATUS_COLOR = {"ai": "grey", "accepted": "positive", "edited": "primary"}
 PAGE_SIZE = 24
 NAV = [("Photos", "photo_library", "/"), ("People", "face", "/people"), ("Places", "place", "/places"),
-       ("Favorites", "star", "/favorites"), ("Review log", "history", "/log")]
+       ("Favorites", "star", "/favorites"), ("Add photos", "add_photo_alternate", "/add"),
+       ("Review log", "history", "/log")]
+# The sidebar has the same dark blue as the header, in light and dark mode
+CSS = """
+body.body--light { background: #f6f5fa; }
+body.body--dark { background: #15131f; }
+.q-drawer--right { background: transparent !important; }
+.q-drawer--left, .q-drawer--left .q-drawer__content { background: #24214f !important; }
+.q-drawer--left .q-item { color: #ffffff; }
+body.body--light .spot-panel { background: #ffffff !important; }
+body.body--dark .spot-panel { background: #1f1c2c !important; }
+body.body--light .spot-star { background: rgba(255, 255, 255, .9); }
+body.body--dark .spot-star { background: rgba(20, 18, 30, .85); }
+"""
+UPLOAD_PREFIX = "~upload_"  # "~" sorts after every other name, so existing photo numbers never shift
 GRID = "display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px"
 
 
@@ -146,14 +165,22 @@ def confirm(question, action):
 def layout(active):
     """Header and left sidebar shared by every page, like Google Photos."""
     ui.colors(primary="#24214f", secondary="#b9770e", accent="#b9770e")
-    ui.query("body").style("background:#f6f5fa")
-    with ui.left_drawer(value=True, fixed=True).props("width=220 bordered").classes("bg-white q-pt-md") as nav:
+    ui.add_css(CSS)
+    dark = ui.dark_mode(app.storage.general.get("dark", False))
+
+    def toggle_dark():
+        dark.value = not dark.value
+        app.storage.general["dark"] = dark.value
+        mode_button.props(f"icon={'light_mode' if dark.value else 'dark_mode'}")
+
+    with ui.left_drawer(value=True, fixed=True).props("width=220").classes("q-pt-md spot-nav") as nav:
         for name, icon, path in NAV:
             selected = path == active
             with ui.item(on_click=lambda path=path: ui.navigate.to(path)).classes(
-                    "rounded-r-full q-mr-sm" + (" bg-amber-1 text-weight-bold" if selected else "")):
+                    "rounded-r-full q-mr-sm" + (" text-weight-bold" if selected else "")).style(
+                    "background: rgba(185,119,14,.18)" if selected else ""):
                 with ui.item_section().props("avatar"):
-                    ui.icon(icon, color="secondary" if selected else "grey-7")
+                    ui.icon(icon, color="secondary" if selected else "grey-4")
                 with ui.item_section():
                     ui.label(name)
     with ui.header().classes("items-center bg-primary q-px-md"):
@@ -162,6 +189,8 @@ def layout(active):
         ui.label("photo search for Dreams Come True staff").classes("text-caption opacity-80 gt-sm")
         ui.space()
         ui.link("Download index (CSV)", "/api/export.csv").classes("text-white")
+        mode_button = ui.button(icon="light_mode" if dark.value else "dark_mode", on_click=toggle_dark).props(
+            "flat round color=white").tooltip("Light / dark mode")
 
 
 def star_button(photo_id):
@@ -177,10 +206,10 @@ def star_button(photo_id):
 def photo_card(r, on_open):
     with ui.card().tight().classes("cursor-pointer relative").on("click", lambda r=r: on_open(r["id"])):
         ui.image(f"/photo/{r['id']}/thumb").classes("h-40").props("fit=cover")
-        with ui.element("div").classes("absolute-top-right q-ma-xs bg-white rounded-full"):
+        with ui.element("div").classes("absolute-top-right q-ma-xs rounded-full spot-star"):
             star_button(r["id"])
         with ui.card_section().classes("q-pa-sm"):
-            ui.label(f"Photo {r['id']}").classes("text-caption text-grey-7")
+            ui.label(f"Photo {r['id'] + 1}").classes("text-caption text-grey-7")
             ui.label(r["caption"]).classes("text-body2")
             with ui.row().classes("gap-1 q-mt-xs"):
                 ui.badge(r["activity"]).props("color=primary")
@@ -231,7 +260,7 @@ def index(person: str = "", location: str = ""):
         pager_bottom = ui.row().classes("w-full justify-center")
 
     # fixed: the panel stays on screen while the photo grid scrolls
-    with ui.right_drawer(value=False, fixed=True).props("width=420 bordered").classes("bg-white q-pa-md") as drawer:
+    with ui.right_drawer(value=False, fixed=True).props("width=420 bordered").classes("q-pa-md spot-panel") as drawer:
         detail = ui.column().classes("w-full gap-2")
 
     def set_query(text):
@@ -307,7 +336,7 @@ def index(person: str = "", location: str = ""):
             ui.image(f"/photo/{photo_id}/large").classes("w-full rounded-borders cursor-pointer").on("click", big.open)
             ui.label("Click the photo to enlarge it").classes("text-caption text-grey-7")
             with ui.row().classes("items-center gap-2"):
-                ui.label(f"Photo {photo_id}").classes("text-subtitle2")
+                ui.label(f"Photo {photo_id + 1}").classes("text-subtitle2")
                 star_button(photo_id)
                 ui.badge("AI suggestion" if r["status"] == "ai" else f"staff {r['status']}").props(
                     f"color={STATUS_COLOR[r['status']]}")
@@ -358,11 +387,23 @@ def index(person: str = "", location: str = ""):
 
             with ui.row().classes("gap-2"):
                 ui.button("Accept description", icon="check", on_click=lambda: confirm(
-                    f"Mark the AI description of photo {photo_id} as correct?", lambda: save("accepted"))).props(
+                    f"Mark the AI description of photo {photo_id + 1} as correct?", lambda: save("accepted"))).props(
                     "unelevated color=positive")
                 ui.button("Save my changes", icon="edit", on_click=lambda: confirm(
-                    f"Save your changes to the description of photo {photo_id}?", lambda: save("edited"))).props(
+                    f"Save your changes to the description of photo {photo_id + 1}?", lambda: save("edited"))).props(
                     "unelevated color=primary")
+
+            def remove():
+                engine.remove(photo_id)
+                FAVORITES.discard(photo_id)
+                drawer.hide()
+                ui.notify(f"Photo {photo_id + 1} removed. The file is in data/removed.", type="warning")
+                run_search()
+
+            ui.separator().classes("q-my-sm")
+            ui.button("Remove photo", icon="delete", on_click=lambda: confirm(
+                f"Remove photo {photo_id + 1} from the archive? The file is moved to data/removed, "
+                "so it can be put back by hand.", remove)).props("outline color=negative")
         drawer.show()
 
     search_box.on("keydown.enter", lambda: run_search())
@@ -374,6 +415,8 @@ def people_page():
     layout("/people")
     counts = {}
     for r in engine.rows:
+        if r.get("removed"):
+            continue
         for p in r.get("person_ids", "").split(";"):
             if p:
                 counts[p] = counts.get(p, 0) + 1
@@ -398,7 +441,8 @@ def places_page():
     layout("/places")
     places = {}
     for r in engine.rows:
-        places.setdefault(r["location"], []).append(r)
+        if not r.get("removed"):
+            places.setdefault(r["location"], []).append(r)
     with ui.column().classes("w-full q-pa-lg gap-3"):
         ui.label("Places").classes("text-h5")
         ui.label("Where the photos were taken, as recognized by the AI. Click a place to see its photos.").classes(
@@ -424,11 +468,74 @@ def favorites_page():
         ui.label("Click the star on any photo to add it here. For now favorites are kept until the app "
                  "restarts, saving them comes later.").classes("text-grey-7")
         with ui.element("div").classes("w-full").style(GRID):
-            favs = [engine.rows[i] for i in sorted(FAVORITES)]
+            favs = [engine.rows[i] for i in sorted(FAVORITES) if not engine.rows[i].get("removed")]
             if not favs:
                 ui.label("No favorites yet.").classes("text-grey-7")
             for r in favs:
                 photo_card(r, open_big)
+
+
+def waiting_uploads():
+    known = {r["file"] for r in engine.rows}
+    return sorted(f for f in DATA.iterdir() if f.name.startswith(UPLOAD_PREFIX) and f.name not in known)
+
+
+@ui.page("/add")
+def add_page():
+    layout("/add")
+    with ui.column().classes("w-full q-pa-lg gap-3"):
+        ui.label("Add photos").classes("text-h5")
+        ui.label("1. Drop new event photos below (jpg, png or iPhone heic). "
+                 "2. Click Describe new photos. The AI writes the caption, event, location and clothing "
+                 "on this laptop, about 6 seconds per photo. Nothing leaves the computer.").classes("text-grey-7")
+
+        waiting = ui.column().classes("gap-1")
+        status = ui.label().classes("text-grey-8")
+
+        def refresh():
+            waiting.clear()
+            files = waiting_uploads()
+            with waiting:
+                for f in files:
+                    ui.label(f"Waiting: {f.name[len(UPLOAD_PREFIX) + 16:]}").classes("text-body2")
+            status.text = f"{len(files)} photos waiting to be described" if files else "No photos waiting."
+            describe.set_enabled(bool(files))
+
+        async def received(e):
+            name = re.sub(r"[^\w.\- ]", "_", e.file.name)
+            path = DATA / f"{UPLOAD_PREFIX}{datetime.now():%Y%m%d_%H%M%S}_{name}"
+            saved = e.file.save(path)
+            if inspect.isawaitable(saved):
+                await saved
+            refresh()
+
+        async def describe_new():
+            files = waiting_uploads()
+            if not files:
+                return
+            describe.set_enabled(False)
+            spinner.set_visibility(True)
+            status.text = f"Describing {len(files)} photos, please wait..."
+            try:
+                rows, clip_emb, text_emb, attr_emb = await run.io_bound(
+                    pipeline.process_photos, files, len(engine.rows))
+                engine.add(rows, clip_emb, text_emb, attr_emb)
+                ui.notify(f"{len(rows)} photos added and searchable", type="positive")
+            except Exception as err:
+                ui.notify(f"Could not describe the photos: {err}", type="negative", multi_line=True)
+            spinner.set_visibility(False)
+            refresh()
+
+        ui.upload(label="Drop photos here or click +", multiple=True, auto_upload=True,
+                  on_upload=received).props("accept=.jpg,.jpeg,.png,.heic").classes("w-full max-w-xl")
+        with ui.row().classes("items-center gap-3"):
+            describe = ui.button("Describe new photos", icon="auto_awesome", on_click=describe_new).props(
+                "unelevated color=secondary")
+            spinner = ui.spinner(size="lg")
+            spinner.set_visibility(False)
+        ui.label("New photos join the People groups at the next full run of pipeline.py.").classes(
+            "text-caption text-grey-7")
+        refresh()
 
 
 @ui.page("/log")
@@ -437,7 +544,7 @@ def log_page():
     with ui.column().classes("w-full q-pa-lg"):
         ui.label("Review log").classes("text-h5")
         ui.label("Every accept and edit by staff, newest first").classes("text-grey-7")
-        rows = [{"time": e["time"], "photo": e["photo_id"], "decision": e["decision"], "reviewer": e["reviewer"],
+        rows = [{"time": e["time"], "photo": e["photo_id"] + 1, "decision": e["decision"], "reviewer": e["reviewer"],
                  "changed": ", ".join(f"{k}: {e['before'][k]} → {v}" for k, v in e["after"].items()) or "-",
                  "note": e["note"]} for e in engine.audit_log(200)]
         ui.table(columns=[{"name": c, "label": c.title(), "field": c, "align": "left"} for c in

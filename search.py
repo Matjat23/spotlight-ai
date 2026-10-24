@@ -22,14 +22,27 @@ from transformers import AutoModel, AutoTokenizer, CLIPModel, CLIPProcessor
 
 ROOT = Path(__file__).parent
 OUT = ROOT / "outputs"
+DATA = ROOT / "data" / "raw"
+REMOVED = ROOT / "data" / "removed"
 CLIP_NAME = "openai/clip-vit-base-patch32"
 TEXT_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 RRF_K = 60  # standard constant for Reciprocal Rank Fusion
+# When is a photo a match at all (tuned on a few searches, check with the test set)
+MIN_TEXT = 0.30       # caption meaning (MiniLM cosine)
+TEXT_SHARE = 0.6      # and at least this share of the best caption match
+KEYWORD_SHARE = 0.5   # keyword score at least this share of the best keyword match
+MIN_IMAGE = 0.21      # photo content (CLIP cosine)
+IMAGE_MARGIN = 0.03   # and at most this far below the best photo match
 EDITABLE = {"caption", "activity", "location", "person_attributes", "objects"}
 
 
+# Filler words appear in almost every caption, so they would match every photo
+STOPWORDS = {"a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "with", "by", "is", "are",
+             "it", "its", "this", "that", "some", "their", "his", "her", "photo", "picture", "image"}
+
+
 def tokenize(text):
-    return re.findall(r"[a-z0-9]+", text.lower())
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOPWORDS]
 
 
 class BM25:
@@ -94,10 +107,12 @@ class SearchEngine:
 
     # Search
 
-    def search(self, query, filters=None, top=40, use=("image", "caption", "keyword")):
+    def search(self, query, filters=None, top=40, use=("image", "caption", "keyword"), only_matches=True):
         """Returns a list of (row, score, why) best first. Empty query lists everything.
 
-        use picks which searches are combined, evaluate.py uses it to compare them."""
+        use picks which searches are combined, evaluate.py uses it to compare them.
+        only_matches drops photos that are not close to the search at all, otherwise every
+        search returns the whole archive in a different order."""
         start = time.time()
         ids = self._filtered(filters or {})
         if not query.strip():
@@ -120,12 +135,26 @@ class SearchEngine:
             for rank, i in enumerate(order):
                 fused[i] = fused.get(i, 0.0) + 1.0 / (RRF_K + rank + 1)
                 why.setdefault(i, {})[name] = rank + 1
+        if only_matches:
+            fused = {i: s for i, s in fused.items() if self._matches(i, lists, use)}
         best = sorted(fused, key=fused.get, reverse=True)[:top]
         hits = [(self.rows[i], fused[i], why[i]) for i in best]
         return hits, time.time() - start
 
+    def _matches(self, i, lists, use):
+        """A photo counts as a match if the words appear in its description, its caption means
+        nearly the same as the search, or it looks almost as close as the best image match."""
+        words = lists["keyword"]
+        if "keyword" in use and words[i] > 0 and words[i] >= KEYWORD_SHARE * words.max():
+            return True
+        text = lists["caption"]
+        if "caption" in use and text[i] >= max(MIN_TEXT, TEXT_SHARE * text.max()):
+            return True
+        image = lists["image"]
+        return "image" in use and image[i] >= max(MIN_IMAGE, image.max() - IMAGE_MARGIN)
+
     def _filtered(self, filters):
-        ids = set(range(len(self.rows)))
+        ids = {i for i, r in enumerate(self.rows) if not r.get("removed")}
         for field in ("activity", "location", "event_id"):
             if filters.get(field):
                 ids = {i for i in ids if self.rows[i][field] == filters[field]}
@@ -144,18 +173,19 @@ class SearchEngine:
     def pivot(self, photo_id, kind, top=40):
         """kind: event, location or person. Never uses faces, only stored fields and text."""
         r = self.rows[photo_id]
+        rows = [x for x in self.rows if not x.get("removed")]
         if kind == "event":
-            same = [x for x in self.rows if x["event_id"] == r["event_id"] and x["id"] != photo_id]
+            same = [x for x in rows if x["event_id"] == r["event_id"] and x["id"] != photo_id]
             return same[:top]
         if kind == "location":
-            same = [x for x in self.rows if x["location"] == r["location"] and x["id"] != photo_id]
+            same = [x for x in rows if x["location"] == r["location"] and x["id"] != photo_id]
             # Most similar looking first, so the same room comes before other stores
             same.sort(key=lambda x: -float(self.clip_emb[x["id"]] @ self.clip_emb[photo_id]))
             return same[:top]
         if kind == "person":
             # 1. Face groups: photos that share an anonymous person group (P01...) come first
             groups = set(r.get("person_ids", "").split(";")) - {""}
-            by_face = [x for x in self.rows if x["id"] != photo_id
+            by_face = [x for x in rows if x["id"] != photo_id
                        and groups & set(x.get("person_ids", "").split(";"))]
             # 2. Clothing backup: at least 2 shared items, ranked by Jaccard (shared / all).
             # One shared item like "blue top" matches half the archive, so it is not enough.
@@ -177,11 +207,12 @@ class SearchEngine:
     # Staff review
 
     def facets(self):
+        rows = [r for r in self.rows if not r.get("removed")]
         return {
-            "activity": sorted({r["activity"] for r in self.rows}),
-            "location": sorted({r["location"] for r in self.rows}),
-            "attribute": sorted({a for r in self.rows for a in r["person_attributes"].split(";") if a}),
-            "year": sorted({r["taken"][:4] for r in self.rows if r["taken"]}, reverse=True),
+            "activity": sorted({r["activity"] for r in rows}),
+            "location": sorted({r["location"] for r in rows}),
+            "attribute": sorted({a for r in rows for a in r["person_attributes"].split(";") if a}),
+            "year": sorted({r["taken"][:4] for r in rows if r["taken"]}, reverse=True),
         }
 
     def review(self, photo_id, decision, changes=None, reviewer="staff", note=""):
@@ -201,10 +232,59 @@ class SearchEngine:
         r["status"] = entry["decision"]
         if changes:
             self.bm25 = BM25([search_text(x) for x in self.rows])
+        self._save_rows()
+        self._log(entry)
+        return entry
+
+    # Adding and removing photos
+
+    def add(self, rows, clip_emb, text_emb, attr_emb):
+        """Appends newly processed photos. Same day as a known event = that event, else a new one."""
+        days = {x["taken"][:10]: x for x in self.rows if x["taken"]}
+        next_event = max(int(x["event_id"][1:]) for x in self.rows) + 1 if self.rows else 1
+        for r in rows:
+            known = days.get(r["taken"][:10]) if r["taken"] else None
+            if known:
+                r["event_id"], r["event_name"] = known["event_id"], known["event_name"]
+            else:
+                r["event_id"], r["event_name"] = f"E{next_event:02d}", r["activity"]
+                next_event += 1
+                if r["taken"]:
+                    days[r["taken"][:10]] = r
+            r.setdefault("person_ids", "")
+            self.rows.append(r)
+            self._log({"time": datetime.now().isoformat(timespec="seconds"), "photo_id": r["id"],
+                       "decision": "added", "reviewer": "staff", "before": {}, "after": {}, "note": ""})
+        self.clip_emb = np.vstack([self.clip_emb, clip_emb])
+        self.text_emb = np.vstack([self.text_emb, text_emb])
+        self.attr_emb = np.vstack([self.attr_emb, attr_emb])
+        np.save(OUT / "clip_embeddings.npy", self.clip_emb)
+        np.save(OUT / "text_embeddings.npy", self.text_emb)
+        np.save(OUT / "attr_embeddings.npy", self.attr_emb)
+        self.bm25 = BM25([search_text(x) for x in self.rows])
+        self._save_rows()
+
+    def remove(self, photo_id, reviewer="staff", note=""):
+        """Hides a photo everywhere and moves the file to data/removed. The record keeps its
+        number, so every other photo number (and the test set) stays the same."""
+        r = self.rows[photo_id]
+        src = DATA / r["file"]
+        if src.exists():
+            REMOVED.mkdir(parents=True, exist_ok=True)
+            src.rename(REMOVED / r["file"])
+        r["removed"] = True
+        self._save_rows()
+        entry = {"time": datetime.now().isoformat(timespec="seconds"), "photo_id": photo_id,
+                 "decision": "removed", "reviewer": reviewer, "before": {}, "after": {}, "note": note}
+        self._log(entry)
+        return entry
+
+    def _save_rows(self):
         (OUT / "photos.json").write_text(json.dumps(self.rows, indent=1), encoding="utf-8")
+
+    def _log(self, entry):
         with open(OUT / "audit_log.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
-        return entry
 
     def audit_log(self, last=50):
         path = OUT / "audit_log.jsonl"

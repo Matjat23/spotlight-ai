@@ -196,8 +196,9 @@ def parse_json(answer):
         return {}
 
 
-def describe_with_qwen(files):
-    """One structured description per photo. Runs alone on the GPU, then frees it."""
+def describe_with_qwen(files, times=None):
+    """One structured description per photo. Runs alone on the GPU, then frees it.
+    If a list is given as times, the seconds per photo are added to it."""
     quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(QWEN_NAME, quantization_config=quant, device_map="cuda")
     proc = AutoProcessor.from_pretrained(QWEN_NAME, min_pixels=128 * 28 * 28, max_pixels=400 * 28 * 28)
@@ -206,11 +207,14 @@ def describe_with_qwen(files):
 
     results = []
     for n, path in enumerate(files, 1):
+        started = time.time()
         inputs = proc(text=[prompt], images=[load_image(path, 896)], return_tensors="pt").to(model.device)
         with torch.no_grad():
             out = model.generate(**inputs, max_new_tokens=200, do_sample=False)
         answer = proc.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
         results.append(parse_json(answer))
+        if times is not None:
+            times.append(time.time() - started)
         print(f"  Qwen {n}/{len(files)}", flush=True)
 
     del model
@@ -326,6 +330,58 @@ def group_people(faces, count):
     grouped = [{"photo": f[0], "person": names[lab], "box": f[2], "score": f[3]}
                for f, lab in zip(faces, labels) if lab in names]
     return people, grouped
+
+
+def process_photos(files, start_id):
+    """Describes photos added in the app, without running the whole archive again.
+    Returns the new records and their CLIP, text and clothing embeddings. Faces are not
+    grouped here, new photos join person groups at the next full run."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    described = describe_with_qwen(files) if device == "cuda" else [{} for _ in files]
+
+    clip = CLIPModel.from_pretrained(CLIP_NAME, torch_dtype=dtype).to(device).eval()
+    clip_proc = CLIPProcessor.from_pretrained(CLIP_NAME)
+    act_emb = clip_text(clip, clip_proc, list(ACTIVITIES.values()), device)
+    loc_emb = clip_text(clip, clip_proc, list(LOCATIONS.values()), device)
+    images = [load_image(f) for f in files]
+    with torch.no_grad():
+        c = clip_proc(images=images, return_tensors="pt").to(device)
+        img_emb = features(clip.get_image_features(pixel_values=c["pixel_values"].to(dtype)))
+        act_sim = (img_emb @ act_emb.T).float().cpu().numpy()
+        loc_sim = (img_emb @ loc_emb.T).float().cpu().numpy()
+
+    rows = []
+    for k, (path, img, d) in enumerate(zip(files, images, described)):
+        activity, act_conf = pick(d.get("activity"), ACTIVITIES, label_probs(act_sim[k]))
+        location, loc_conf = pick(d.get("location"), LOCATIONS, label_probs(loc_sim[k]))
+        when = taken_at(path)
+        rows.append({
+            "id": start_id + k,
+            "file": path.name,
+            "caption": clean_caption(d.get("caption") or "No description yet"),
+            "activity": activity,
+            "activity_conf": round(act_conf, 2),
+            "location": location,
+            "location_conf": round(loc_conf, 2),
+            "person_attributes": ";".join(dict.fromkeys(c for c in d.get("clothing", []) if c in CLOTHING)),
+            "objects": ";".join(str(o).strip().lower() for o in d.get("objects", [])[:5]),
+            "person_ids": "",
+            "taken": when.isoformat(sep=" ") if when else "",
+            "orientation": "portrait" if img.height > img.width else "landscape",
+            "status": "ai",
+        })
+
+    text_tok = AutoTokenizer.from_pretrained(TEXT_NAME)
+    text_model = AutoModel.from_pretrained(TEXT_NAME).to(device).eval()
+    search_text = [f"{r['caption']}. {r['activity']} at {r['location']}. "
+                   f"{r['person_attributes'].replace(';', ', ')}. {r['objects'].replace(';', ', ')}" for r in rows]
+    attr_text = [r["person_attributes"].replace(";", ", ") or "no visible attributes" for r in rows]
+    result = (rows, img_emb.float().cpu().numpy(), text_embed(search_text, text_tok, text_model, device),
+              text_embed(attr_text, text_tok, text_model, device))
+    del clip, text_model
+    torch.cuda.empty_cache()
+    return result
 
 
 def main():
