@@ -11,6 +11,7 @@ HF_MODELS = [
     "openai/clip-vit-base-patch32",            # text <-> image search, zero-shot tags
     "Salesforce/blip-image-captioning-large",  # photo captions
     "microsoft/Florence-2-base",               # captions and object tags
+    "florence-community/Florence-2-base",      # same model for the built-in transformers class (compare_models.py)
     "MCG-NJU/videomae-base-finetuned-kinetics",  # actions in video
     "trpakov/vit-face-expression",             # emotions from face crops
     "sentence-transformers/all-MiniLM-L6-v2",  # text embeddings

@@ -1,4 +1,4 @@
-# Spotlight AI
+# spotlight.io
 
 Search and tag nonprofit photo collections with vision-language models.
 Built by our team at the AI4Good Hackathon 2026 (UNF FL-DSSG, Ponte Vedra Beach, October 2026).

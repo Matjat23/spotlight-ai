@@ -2,7 +2,7 @@
 
 eval/test_queries.csv has one row per query:
     query,relevant_ids,notes
-    birthday cake,6;97,ids of the right photos separated by ;
+    birthday cake,7;98,photo numbers from the app separated by ;
 
     python evaluate.py
 
@@ -11,6 +11,11 @@ hybrid search beats each part on its own.
 """
 import csv
 from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 
 from search import SearchEngine
 
@@ -27,7 +32,8 @@ def load_queries():
     rows = []
     with open(QUERIES, encoding="utf-8") as f:
         for r in csv.DictReader(f):
-            ids = {int(x) for x in r["relevant_ids"].replace(",", ";").split(";") if x.strip()}
+            # Photo numbers as shown in the app start at 1, the code counts from 0
+            ids = {int(x) - 1 for x in r["relevant_ids"].replace(",", ";").split(";") if x.strip()}
             if r["query"].strip() and ids:
                 rows.append((r["query"].strip(), ids))
     return rows
@@ -36,7 +42,7 @@ def load_queries():
 def score(engine, queries, use):
     r5 = r10 = mrr = 0.0
     for query, relevant in queries:
-        hits, _ = engine.search(query, top=10, use=use)
+        hits, _ = engine.search(query, top=10, use=use, only_matches=False)
         ranked = [r["id"] for r, _, _ in hits]
         r5 += len(relevant & set(ranked[:5])) / len(relevant)
         r10 += len(relevant & set(ranked[:10])) / len(relevant)
@@ -53,9 +59,29 @@ def main():
     engine = SearchEngine()
     print(f"{len(queries)} test queries\n")
     print(f"{'Method':30} {'Recall@5':>9} {'Recall@10':>10} {'MRR':>6}")
+    results = {}
     for name, use in METHODS.items():
         r5, r10, mrr = score(engine, queries, use)
+        results[name] = (r5, r10, mrr)
         print(f"{name:30} {r5:9.2f} {r10:10.2f} {mrr:6.2f}")
+    chart(results, len(queries))
+
+
+def chart(results, n):
+    """Grouped bars: each search method on Recall@5, Recall@10 and MRR. Opens in VS Code."""
+    names = list(results)
+    x = np.arange(3)
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    for k, name in enumerate(names):
+        ax.bar(x + k * 0.2 - 0.3, results[name], 0.2, label=name)
+    ax.set_xticks(x, ["Recall@5", "Recall@10", "MRR"])
+    ax.set_ylim(0, 1)
+    ax.set_title(f"Search quality on {n} test queries (higher is better)")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    out = Path(__file__).parent / "outputs" / "search_quality.png"
+    fig.savefig(out, dpi=120)
+    print(f"\nChart saved: {out} (open it in VS Code)")
 
 
 if __name__ == "__main__":
