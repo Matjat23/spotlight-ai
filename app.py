@@ -629,6 +629,8 @@ def index(person: str = "", location: str = "", kind: str = ""):
         with ui.row().classes("gap-3 items-center"):
             f_activity = ui.select(facets["activity"], label="Event / activity", clearable=True,
                                    on_change=lambda: run_search()).classes("w-48")
+            f_attribute = ui.select(facets["attribute"], label="Person attribute", clearable=True,
+                                    on_change=lambda: run_search()).classes("w-48")
             f_moment = ui.select(facets["moment"] or pipeline.MOMENTS, label="Moment", clearable=True,
                                  on_change=lambda: run_search()).classes("w-36")
             f_year = ui.select(facets["year"], label="Year", clearable=True,
@@ -659,7 +661,7 @@ def index(person: str = "", location: str = "", kind: str = ""):
 
 
     def filters():
-        return {"activity": f_activity.value, "location": state["location"], "attribute": None,
+        return {"activity": f_activity.value, "location": state["location"], "attribute": f_attribute.value,
                 "year": f_year.value, "person": state["person"], "consent": f_consent.value,
                 "moment": f_moment.value}
 

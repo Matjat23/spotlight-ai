@@ -64,3 +64,6 @@ logs/
 
 # Staff accounts (password hashes) stay on this laptop
 accounts.json
+
+# The architecture diagram (no photos in it) is shown in the README
+!docs/architecture.png
