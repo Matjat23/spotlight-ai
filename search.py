@@ -72,7 +72,7 @@ def search_text(r):
     attrs = r["person_attributes"].replace(";", ", ")
     objects = r.get("objects", "").replace(";", ", ")
     moments = r.get("moments", "").replace(";", ", ")
-    return f"{r['caption']}. {r['activity']} at {r['location']}. {attrs}. {objects}. {moments}"
+    return f"{r['caption']}. {r['activity']} at {r['location']}. {attrs}. {objects}. {moments}. {r.get('speech', '')}"
 
 
 class SearchEngine:

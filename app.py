@@ -90,6 +90,58 @@ def empty_old_bin():
         if n:
             applog.info("bin_emptied_automatically", photos=n, days=days)
 
+VIDEO_DIR = ROOT / "data" / "videos" / "web"
+VIDEO_INFO = ROOT / "outputs" / "videos.json"
+VIDEOS = json.loads(VIDEO_INFO.read_text(encoding="utf-8")) if VIDEO_INFO.exists() else {}
+FRAME_NAME = re.compile(r"^zz_video_(V[0-9]+)_([0-9]+)[.]jpg$")
+
+
+def video_of(r):
+    """(video id, second) when this row is a moment from a video (made by videos.py), else None."""
+    m = FRAME_NAME.match(r["file"])
+    return (m.group(1), int(m.group(2))) if m and m.group(1) in VIDEOS else None
+
+
+def clock(seconds):
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def item_name(r):
+    """Photo 12, or Video 3 at 0:17 for a moment in a video."""
+    v = video_of(r)
+    if not v:
+        return f"Photo {r['id'] + 1}"
+    return f"Video {int(v[0][1:])}" + (f" at {clock(v[1])}" if v[1] else "")
+
+
+def one_per_video(rows):
+    """Like Google Photos: a video shows once, at its best matching moment (the first one in the list)."""
+    seen, out = set(), []
+    for r in rows:
+        v = video_of(r)
+        if v and v[0] in seen:
+            continue
+        if v:
+            seen.add(v[0])
+        out.append(r)
+    return out
+
+
+def video_moments(vid):
+    rows = [r for r in engine.rows if not r.get("removed") and (video_of(r) or ("",))[0] == vid]
+    return sorted(rows, key=lambda r: video_of(r)[1])
+
+
+@app.get("/video/{vid}")
+def video_file(vid: str):
+    """The browser-friendly copy. FileResponse answers range requests, so the player can jump to a moment."""
+    if vid not in VIDEOS:
+        raise HTTPException(404, "No video with that id")
+    return FileResponse(VIDEO_DIR / VIDEOS[vid]["web"], media_type="video/mp4",
+                        filename=f"spotlight-video-{int(vid[1:])}.mp4", content_disposition_type="inline")
+
+
 def photo_or_404(photo_id):
     if not 0 <= photo_id < len(engine.rows):
         raise HTTPException(404, "No photo with that id")
@@ -242,10 +294,10 @@ def public(r):
 # Photos are numbered from 1 for people. Inside the code (and the /api) they count from 0.
 STATUS_COLOR = {"ai": "grey", "accepted": "positive", "edited": "primary"}
 PAGE_SIZE = 24
-NAV = [("Library", [("Photos", "photo_library", "/"), ("People", "face", "/people"),
+NAV = [("Library", [("Photos", "photo_library", "/"), ("Videos", "smart_display", "/?kind=video"),
+                    ("People", "face", "/people"),
                     ("Places", "place", "/places"), ("Favorites", "favorite", "/favorites")]),
        ("Manage", [("Add photos", "add_photo_alternate", "/add"), ("Duplicates", "content_copy", "/duplicates"),
-                   ("Review log", "history", "/log"),
                    ("Bin", "delete", "/bin"), ("System", "monitor_heart", "/system"),
                    ("Accounts", "manage_accounts", "/accounts")])]
 ADMIN_PAGES = {"/duplicates", "/bin", "/system", "/accounts"}
@@ -409,18 +461,24 @@ def photo_card(r, on_open, selection=None, on_select=None):
     copies = duplicates()["copies"].get(r["id"], [])
     with ui.card().tight().classes("cursor-pointer relative full-height").on("click", lambda r=r: on_open(r["id"])):
         ui.image(f"/photo/{r['id']}/thumb").classes("h-44").props(f"fit=cover position='{focus(r['id'])}'")
+        video = video_of(r)
+        if video:  # play button and length, like Google Photos
+            ui.icon("play_circle", size="44px", color="white").classes("absolute").style(
+                "top:66px;left:50%;transform:translateX(-50%);opacity:.9;filter:drop-shadow(0 1px 4px rgba(0,0,0,.6))")
+            ui.badge(clock(VIDEOS[video[0]]["duration"])).props("color=grey-10").classes("absolute").style(
+                "top:146px;right:6px;opacity:.85")
         if copies:
             ui.badge(f"{len(copies) + 1} copies").props("color=grey-9").classes("absolute q-ma-xs").style(
                 "top:150px;left:4px").tooltip("The same photo is in the archive more than once (for example "
                                               f"iPhone and JPG). Also photo {', '.join(str(c + 1) for c in copies)}")
         with ui.element("div").classes("absolute-top-right q-ma-xs rounded-full spot-star"):
             heart_button(r["id"])
-        if selection is not None:
+        if selection is not None and not video:
             with ui.element("div").classes("absolute-top-left q-ma-xs rounded-full spot-star"):
                 select_button(r["id"], selection, on_select)
         with ui.card_section().classes("q-pa-sm"):
             with ui.row().classes("items-center gap-1"):
-                ui.label(f"Photo {r['id'] + 1}").classes("text-caption text-grey-7")
+                ui.label(item_name(r)).classes("text-caption text-grey-7")
                 if consent_of(r) == "OK for marketing":
                     ui.icon("verified", color="positive", size="xs").tooltip("Photo release signed: OK for marketing")
             ui.label(r["caption"]).classes("text-body2 spot-caption").tooltip(r["caption"])
@@ -459,7 +517,7 @@ def duplicates():
     """Exact copies (same file name with another extension, like an iPhone .heic and its .jpg, or a
     practically identical photo) and very similar photos. One card per copy group is shown in the grid,
     the other copies are hidden. Pairs marked as not duplicates are never grouped again."""
-    rows = [r for r in engine.rows if not r.get("removed")]
+    rows = [r for r in engine.rows if not r.get("removed") and not video_of(r)]
     skip = not_duplicates()
     key = (len(rows), len(skip))
     if _dupes["key"] == key:
@@ -502,6 +560,11 @@ def download_photos(ids, size):
         go()
 
 
+def download_video(vid):
+    applog.info("download_video", video=int(vid[1:]))
+    ui.download(f"/video/{vid}", f"spotlight-video-{int(vid[1:])}.mp4")
+
+
 def open_big(photo_id):
     with ui.dialog() as big, ui.card().classes("q-pa-none").style("max-width:95vw"):
         ui.image(f"/photo/{photo_id}/large").props("fit=contain").style("width:90vw;height:85vh")
@@ -509,8 +572,8 @@ def open_big(photo_id):
 
 
 @ui.page("/")
-def index(person: str = "", location: str = ""):
-    layout("/")
+def index(person: str = "", location: str = "", kind: str = ""):
+    layout("/?kind=video" if kind == "video" else "/")
     # Person and place come from the People and Places pages and show as removable chips
     state = {"pivot": None, "selected": None, "rows": [], "page": 1, "person": person, "location": location}
     chosen = set()  # photos ticked for download
@@ -586,7 +649,14 @@ def index(person: str = "", location: str = ""):
                         filters=sorted(k for k, v in filters().items() if v))
         hidden = duplicates()["hidden"]
         hits = [h for h in hits if h[0]["id"] not in hidden]
-        status.text = f"{len(hits)} photos in {took * 1000:.0f} ms"
+        if kind == "video":
+            hits = [h for h in hits if video_of(h[0])]
+        rows = one_per_video([r for r, _, _ in hits])
+        n_videos = sum(1 for r in rows if video_of(r))
+        counts = [f"{len(rows) - n_videos} photos"] if kind != "video" else []
+        if n_videos or kind == "video":
+            counts.append(f"{n_videos} video{'s' if n_videos != 1 else ''}")
+        status.text = f"{' and '.join(counts)} in {took * 1000:.0f} ms"
         pivot_bar.clear()
         if state["person"]:
             with pivot_bar:
@@ -596,7 +666,7 @@ def index(person: str = "", location: str = ""):
             with pivot_bar:
                 ui.chip(f"Place: {state['location']}", icon="place", removable=True,
                         on_value_change=clear_location).props("color=secondary text-color=white")
-        show([r for r, _, _ in hits])
+        show(rows)
 
     def run_pivot(photo_id, kind):
         hidden = duplicates()["hidden"]
@@ -611,7 +681,7 @@ def index(person: str = "", location: str = ""):
         with pivot_bar:
             ui.chip(f"Pivot: {label}", icon="hub", removable=True,
                     on_value_change=lambda: run_search()).props("color=secondary text-color=white")
-        show([r] + rows)
+        show(one_per_video([r] + rows))
 
     def show(rows):
         state["rows"] = rows
@@ -662,28 +732,65 @@ def index(person: str = "", location: str = ""):
             close_detail()  # clicking the same photo again closes the panel
             return
         r = engine.rows[photo_id]
+        video = video_of(r)
         state["selected"] = photo_id
         detail.clear()
         with detail:
             with ui.row().classes("w-full items-center justify-between"):
-                ui.label("Photo details").classes("text-subtitle1 text-weight-bold")
+                ui.label("Video details" if video else "Photo details").classes("text-subtitle1 text-weight-bold")
                 ui.button(icon="close", on_click=close_detail).props("flat round dense").tooltip("Close (Esc)")
-            with ui.dialog() as big, ui.card().classes("q-pa-none").style("max-width:95vw"):
-                ui.image(f"/photo/{photo_id}/large").props("fit=contain").style("width:90vw;height:85vh")
-            ui.image(f"/photo/{photo_id}/large").classes("w-full rounded-borders cursor-pointer").on("click", big.open)
-            ui.label("Click the photo to enlarge it").classes("text-caption text-grey-7")
-            with ui.row().classes("gap-2"):
+            if video:
+                vid, second = video
+                # #t= starts the player at the moment the search found
+                player = ui.video(f"/video/{vid}#t={second}", autoplay=False).classes("w-full rounded-borders")
+                ui.label("Moments in this video (click to jump)").classes("text-overline q-mt-sm")
+                with ui.row().classes("gap-1"):
+                    for m in video_moments(vid):
+                        t = video_of(m)[1]
+                        ui.chip(clock(t), icon="play_arrow", on_click=lambda t=t: (player.seek(t), player.play())).props(
+                            "dense clickable" + ("" if t != second else " color=secondary text-color=white")).tooltip(
+                            m["caption"])
+                said = VIDEOS[vid].get("speech", [])
+                if said:
+                    ui.label("What is said (click a line to jump)").classes("text-overline q-mt-sm")
+                    with ui.scroll_area().classes("w-full rounded-borders").style("max-height:180px"):
+                        for start, _, text in said:
+                            with ui.row().classes("no-wrap items-start gap-2 cursor-pointer w-full").on(
+                                    "click", lambda t=start: (player.seek(t), player.play())):
+                                ui.label(clock(start)).classes("text-caption text-secondary text-weight-bold")
+                                ui.label(text).classes("text-body2")
+                    ui.label("Written down by Whisper on this laptop. It can mishear words.").classes(
+                        "text-caption text-grey-7")
+                with ui.row().classes("gap-2 q-mt-sm"):
+                    ui.button("Download video", icon="download",
+                              on_click=lambda: download_video(vid)).props("unelevated dense color=secondary")
+                with ui.row().classes("items-center gap-2"):
+                    ui.label(f"Video {int(vid[1:])}").classes("text-subtitle2")
+                    heart_button(photo_id)
+                    ui.label(f"{clock(VIDEOS[vid]['duration'])} long").classes("text-caption text-grey-7")
+                    if r["taken"]:
+                        ui.label(r["taken"][:10]).classes("text-caption text-grey-7")
+                ui.label(f"The description below is for the moment at {clock(second)}.").classes(
+                    "text-caption text-grey-7")
+            else:
+                with ui.dialog() as big, ui.card().classes("q-pa-none").style("max-width:95vw"):
+                    ui.image(f"/photo/{photo_id}/large").props("fit=contain").style("width:90vw;height:85vh")
+                ui.image(f"/photo/{photo_id}/large").classes("w-full rounded-borders cursor-pointer").on("click", big.open)
+                ui.label("Click the photo to enlarge it").classes("text-caption text-grey-7")
+            with ui.row().classes("gap-2") as photo_buttons:
                 ui.button("Download", icon="download", on_click=lambda: download_photos([photo_id], "original")).props(
                     "unelevated dense color=secondary").tooltip("Original quality, for print")
                 ui.button("Rotate", icon="rotate_right", on_click=lambda: rotate(photo_id)).props(
                     "outline dense color=secondary").tooltip("Turn the photo 90 degrees clockwise")
-            with ui.row().classes("items-center gap-2"):
+            with ui.row().classes("items-center gap-2") as photo_info:
                 ui.label(f"Photo {photo_id + 1}").classes("text-subtitle2")
                 heart_button(photo_id)
                 ui.badge("AI suggestion" if r["status"] == "ai" else f"staff {r['status']}").props(
                     f"color={STATUS_COLOR[r['status']]}")
                 if r["taken"]:
                     ui.label(r["taken"][:10]).classes("text-caption text-grey-7")
+            photo_buttons.set_visibility(not video)
+            photo_info.set_visibility(not video)
 
             ui.label("Show me more").classes("text-overline q-mt-sm")
             with ui.row().classes("gap-2"):
@@ -741,16 +848,17 @@ def index(person: str = "", location: str = ""):
                     "unelevated color=primary")
 
             def remove():
-                engine.remove(photo_id, reviewer=who())
+                for m in (video_moments(video[0]) if video else [r]):  # a video goes to the bin with all its moments
+                    engine.remove(m["id"], reviewer=who())
                 applog.info("remove", photo=photo_id + 1)
                 FAVORITES.discard(photo_id)
                 drawer.hide()
-                ui.notify(f"Photo {photo_id + 1} moved to the bin. Restore it from the Bin page.", type="warning")
+                ui.notify(f"{item_name(r)} moved to the bin. Restore it from the Bin page.", type="warning")
                 run_search()
 
             ui.separator().classes("q-my-sm")
             ui.button("Move to bin", icon="delete", on_click=lambda: None if not is_admin() else confirm(
-                f"Move photo {photo_id + 1} to the bin? You can restore it from the Bin page until it is "
+                f"Move {item_name(r).lower()} to the bin? You can restore it from the Bin page until it is "
                 "emptied.", remove)).props("outline color=negative").set_visibility(is_admin())
         drawer.show()
 
@@ -1050,7 +1158,7 @@ def bin_page():
                 with ui.card().tight():
                     ui.image(f"/photo/{r['id']}/thumb").classes("h-40").props(f"fit=cover position='{focus(r['id'])}'").style("opacity:.6")
                     with ui.card_section().classes("q-pa-sm"):
-                        ui.label(f"Photo {r['id'] + 1}").classes("text-weight-bold")
+                        ui.label(item_name(r)).classes("text-weight-bold")
                         ui.label(f"Moved {r['removed_at'][:10]} · {days_left(r)}").classes("text-caption text-grey-7")
                         with ui.row().classes("gap-1 q-mt-xs"):
                             ui.button("Restore", icon="restore", on_click=lambda r=r: restore(r)).props(
@@ -1061,10 +1169,15 @@ def bin_page():
 
 @ui.page("/log")
 def log_page():
-    layout("/log")
+    if admin_only():
+        return
+    layout("/system")  # the review log lives under System
     everything = engine.audit_log(100000)
     with ui.column().classes("w-full q-pa-lg gap-3"):
-        ui.label("Review log").classes("text-h5")
+        with ui.row().classes("items-center gap-2"):
+            ui.button(icon="arrow_back", on_click=lambda: ui.navigate.to("/system")).props("flat round dense").tooltip(
+                "Back to System")
+            ui.label("Review log").classes("text-h5")
         ui.label("Every accept, edit, download, upload and removal, newest first, with who did it.").classes(
             "text-grey-7")
         with ui.row().classes("items-center gap-3"):
@@ -1098,7 +1211,8 @@ def system_page():
     problems = [e for e in recent if e["level"] in ("WARNING", "ERROR")][::-1][:50]
     log_size = sum(f.stat().st_size for f in applog.LOG_DIR.glob("app.log*")) / 1e6 if applog.LOG_DIR.exists() else 0
     stats = [
-        ("Photos", sum(1 for r in engine.rows if not r.get("removed"))),
+        ("Photos", sum(1 for r in engine.rows if not r.get("removed") and not video_of(r))),
+        ("Videos", len({video_of(r)[0] for r in engine.rows if not r.get("removed") and video_of(r)})),
         ("Removed", sum(1 for r in engine.rows if r.get("removed"))),
         ("Person groups", len({p for r in engine.rows for p in r.get("person_ids", "").split(";") if p})),
         ("Avg search", f"{sum(e['ms'] for e in searches) / len(searches):.0f} ms" if searches else "no searches yet"),
@@ -1114,6 +1228,15 @@ def system_page():
                 with ui.card().classes("q-pa-md").style("min-width:150px"):
                     ui.label(str(value)).classes("text-h6")
                     ui.label(label).classes("text-caption text-grey-7")
+        with ui.card().classes("w-full q-pa-md cursor-pointer").on("click", lambda: ui.navigate.to("/log")):
+            with ui.row().classes("items-center no-wrap gap-3 w-full"):
+                ui.icon("history", size="28px").classes("text-secondary")
+                with ui.column().classes("gap-0"):
+                    ui.label("Review log").classes("text-subtitle1 text-weight-bold")
+                    ui.label(f"{len(engine.audit_log(100000))} actions: every accept, edit, download, upload and "
+                             "removal, with who did it").classes("text-caption text-grey-7")
+                ui.space()
+                ui.icon("chevron_right").classes("text-grey-6")
         ui.label("Warnings and errors").classes("text-subtitle1 q-mt-md")
         if not problems:
             ui.label("None since the app started.").classes("text-grey-7")

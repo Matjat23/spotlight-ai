@@ -173,6 +173,26 @@ def open_upright(path):
     return img.rotate(-degrees, expand=True) if degrees else img
 
 
+def speech_for(files):
+    """For each file: the words said in a video from this moment until the next moment (from videos.py),
+    or "" for photos. Searching "happy birthday" then finds the moment it was said."""
+    info_file = OUT / "videos.json"
+    info = json.loads(info_file.read_text(encoding="utf-8")) if info_file.exists() else {}
+    moments = {}
+    for n, path in enumerate(files):
+        m = re.match(r"^zz_video_(V[0-9]+)_([0-9]+)[.]jpg$", path.name)
+        if m and m.group(1) in info:
+            moments.setdefault(m.group(1), []).append((int(m.group(2)), n))
+    said = [""] * len(files)
+    for vid, times in moments.items():
+        times.sort()
+        for k, (t, n) in enumerate(times):
+            start = 0 if k == 0 else t
+            end = times[k + 1][0] if k + 1 < len(times) else 1e9
+            said[n] = " ".join(text for a, b, text in info[vid].get("speech", []) if start <= a < end)
+    return said
+
+
 def load_image(path, max_side=1024):
     img = open_upright(path)
     img.thumbnail((max_side, max_side))
@@ -404,7 +424,7 @@ def process_photos(files, start_id):
     text_model = AutoModel.from_pretrained(TEXT_NAME).to(device).eval()
     search_text = [f"{r['caption']}. {r['activity']} at {r['location']}. "
                    f"{r['person_attributes'].replace(';', ', ')}. {r['objects'].replace(';', ', ')}. "
-                   f"{r['moments'].replace(';', ', ')}" for r in rows]
+                   f"{r['moments'].replace(';', ', ')}. {r.get('speech', '')}" for r in rows]
     attr_text = [r["person_attributes"].replace(";", ", ") or "no visible attributes" for r in rows]
     result = (rows, img_emb.float().cpu().numpy(), text_embed(search_text, text_tok, text_model, device),
               text_embed(attr_text, text_tok, text_model, device))
@@ -456,6 +476,7 @@ def main():
     loc_emb = clip_text(clip, clip_proc, list(LOCATIONS.values()), device)
     cloth_emb = clip_text(clip, clip_proc, list(CLOTHING.values()), device)
 
+    said = speech_for(files)
     rows, embeddings = [], []
     for i in range(0, len(files), args.batch):
         batch = files[i : i + args.batch]
@@ -494,6 +515,7 @@ def main():
                 "taken": when.isoformat(sep=" ") if when else "",
                 "orientation": "portrait" if img.height > img.width else "landscape",
                 "person_ids": ";".join(sorted(people[len(rows)])),
+                "speech": said[len(rows)],
                 "status": "ai",  # ai, accepted or edited, changed by staff in the app
             })
         embeddings.append(img_emb.float().cpu().numpy())
@@ -506,7 +528,7 @@ def main():
     # Text embeddings: one for full search, one for the clothing only (same-person pivot)
     search_text = [f"{r['caption']}. {r['activity']} at {r['location']}. "
                    f"{r['person_attributes'].replace(';', ', ')}. {r['objects'].replace(';', ', ')}. "
-                   f"{r['moments'].replace(';', ', ')}" for r in rows]
+                   f"{r['moments'].replace(';', ', ')}. {r['speech']}" for r in rows]
     attr_text = [r["person_attributes"].replace(";", ", ") or "no visible attributes" for r in rows]
     np.save(OUT / "clip_embeddings.npy", img_all)
     np.save(OUT / "text_embeddings.npy", text_embed(search_text, text_tok, text_model, device))
