@@ -433,6 +433,42 @@ def process_photos(files, start_id):
     return result
 
 
+def staff_yes(r):
+    """Search words for the staff questions answered yes (see QUESTIONS in search.py)."""
+    from search import QUESTIONS
+    return " ".join(QUESTIONS[k][1] for k, v in r.get("answers", {}).items() if v == "yes" and k in QUESTIONS)
+
+
+STAFF_FIELDS = ["caption", "activity", "location", "person_attributes", "objects", "moments"]
+
+
+def keep_staff_changes(rows):
+    """A new run must not undo what staff did in the app. For every photo we already knew (same file):
+    captions and labels staff accepted or edited win over the new AI ones, and the photo release
+    is always kept. Runs before the search vectors are made, so search reads the staff text."""
+    old_file = OUT / "photos.json"
+    if not old_file.exists():
+        return
+    old = {r["file"]: r for r in json.loads(old_file.read_text(encoding="utf-8"))}
+    kept = 0
+    for r in rows:
+        before = old.get(r["file"])
+        if not before:
+            continue
+        if before.get("consent", "unknown") != "unknown":
+            r["consent"] = before["consent"]
+        if before.get("answers"):
+            r["answers"] = before["answers"]
+        if before.get("status") in ("accepted", "edited"):
+            r.update({k: before[k] for k in STAFF_FIELDS if k in before})
+            r["status"] = before["status"]
+            kept += 1
+    in_bin = sum(1 for r in old.values() if r.get("removed") and not r.get("deleted"))
+    print(f"Kept staff changes on {kept} photos")
+    if in_bin:
+        print(f"Note: {in_bin} photos in the bin are left out of this run (their files are in data/removed)")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=0, help="only the first N photos")
@@ -524,11 +560,12 @@ def main():
     img_all = np.concatenate(embeddings)
     group_events(rows, img_all)
     harmonize_scenes(rows, img_all)
+    keep_staff_changes(rows)
 
     # Text embeddings: one for full search, one for the clothing only (same-person pivot)
     search_text = [f"{r['caption']}. {r['activity']} at {r['location']}. "
                    f"{r['person_attributes'].replace(';', ', ')}. {r['objects'].replace(';', ', ')}. "
-                   f"{r['moments'].replace(';', ', ')}. {r['speech']}" for r in rows]
+                   f"{r['moments'].replace(';', ', ')}. {staff_yes(r)}. {r['speech']}" for r in rows]
     attr_text = [r["person_attributes"].replace(";", ", ") or "no visible attributes" for r in rows]
     np.save(OUT / "clip_embeddings.npy", img_all)
     np.save(OUT / "text_embeddings.npy", text_embed(search_text, text_tok, text_model, device))

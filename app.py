@@ -7,6 +7,7 @@ Runs only on this computer (127.0.0.1), photos never leave the laptop.
     python app.py           # then open http://127.0.0.1:8080
 """
 import csv
+import hashlib
 import inspect
 import io
 import json
@@ -27,7 +28,7 @@ from pillow_heif import register_heif_opener
 import accounts
 import applog
 import pipeline
-from search import SearchEngine
+from search import QUESTIONS, SearchEngine
 
 register_heif_opener()
 
@@ -53,8 +54,16 @@ def focus(photo_id):
     x = (min(b[0] for b in boxes) + max(b[2] for b in boxes)) / 2
     y = (min(b[1] for b in boxes) + max(b[3] for b in boxes)) / 2
     return f"{x * 100:.0f}% {min(y * 100 + 10, 100):.0f}%"  # a bit below the faces so heads are not cut
-# Favorites only live in memory for now (the look is done, saving comes later)
-FAVORITES = set()
+
+
+def favorites():
+    """Favorite photo ids of the logged in account, kept by NiceGUI across restarts."""
+    return set(app.storage.user.get("favorites", []))
+
+
+def set_favorite(photo_id, on):
+    favs = favorites() | {photo_id} if on else favorites() - {photo_id}
+    app.storage.user["favorites"] = sorted(favs)
 
 
 # REST API (FastAPI)
@@ -154,7 +163,10 @@ def photo_file(photo_id: int, size: str):
     r = photo_or_404(photo_id)
     side = 400 if size == "thumb" else 1400
     turn = pipeline.rotations().get(r["file"], 0)
-    path = THUMBS / f"{photo_id}_{side}_{turn}.jpg"  # a new file after a rotation
+    # Named after the file, not the number: numbers can change when pipeline.py runs again, and then a
+    # cached thumbnail would show another photo. A rotation makes a new file.
+    key = hashlib.sha1(r["file"].encode()).hexdigest()[:16]
+    path = THUMBS / f"{key}_{side}_{turn}.jpg"
     if not path.exists():
         img = pipeline.open_upright(photo_path(r))
         img.thumbnail((side, side))
@@ -207,11 +219,20 @@ def api_pivot(photo_id: int, kind: str):
 @app.post("/api/photos/{photo_id}/review")
 def api_review(photo_id: int, body: dict):
     photo_or_404(photo_id)
-    return engine.review(photo_id, body.get("decision", "accepted"), body.get("changes"), body.get("reviewer", "staff"), body.get("note", ""))
+    decision = body.get("decision", "accepted")
+    if decision not in ("accepted", "edited"):
+        raise HTTPException(400, "decision must be accepted or edited")
+    return engine.review(photo_id, decision, body.get("changes"), who(), body.get("note", ""))
+
+
+def admin_api():
+    if not is_admin():
+        raise HTTPException(403, "Only admins can see the review log")
 
 
 @app.get("/api/audit")
 def api_audit(last: int = 50):
+    admin_api()
     return engine.audit_log(last)
 
 
@@ -219,12 +240,19 @@ def api_audit(last: int = 50):
 def api_export():
     """The structured output file: one row per photo with event, location and attributes."""
     buf = io.StringIO()
-    fields = ["id", "file", "caption", "activity", "location", "person_attributes", "objects", "moments", "person_ids", "event_id", "event_name", "taken", "consent", "status"]
+    fields = ["id", "caption", "activity", "location", "person_attributes", "objects", "moments", "person_ids", "event_id", "event_name", "taken", "consent", "status"]
     writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
-    writer.writerows(engine.rows)
+    # No file names (they can contain children's names) and nothing from the bin
+    writer.writerows({**r, "id": r["id"] + 1} for r in map(safe_cells, engine.rows) if not r.get("removed"))
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=spotlight_index.csv"})
+
+
+def safe_cells(r):
+    """Excel runs a cell starting with = + - or @ as a formula. A caption typed by anyone could do that,
+    so such text gets a ' in front, which Excel shows as plain text."""
+    return {k: "'" + v if isinstance(v, str) and v[:1] in "=+-@" else v for k, v in r.items()}
 
 
 CONSENT = ["unknown", "internal only", "OK for marketing"]
@@ -253,16 +281,16 @@ def log_download(ids, size, by):
 
 
 @app.get("/download/{photo_id}")
-def download_one(photo_id: int, size: str = "original", by: str = "staff"):
+def download_one(photo_id: int, size: str = "original"):
     """One photo. The file name is the photo number, original file names can contain children's names."""
     r = photo_or_404(photo_id)
-    log_download([photo_id], size, by)
+    log_download([photo_id], size, who())
     return Response(jpeg_bytes(r, size), media_type="image/jpeg", headers={
         "Content-Disposition": f"attachment; filename=spotlight_photo_{photo_id + 1}_{size}.jpg"})
 
 
 @app.get("/download-zip")
-def download_zip(ids: str, size: str = "web", by: str = "staff"):
+def download_zip(ids: str, size: str = "web"):
     """Several photos in one ZIP, with captions.csv (caption, event, location, consent) for each photo."""
     chosen = [int(x) for x in ids.split(",") if x.strip().isdigit()]
     chosen = [i for i in chosen if 0 <= i < len(engine.rows) and not engine.rows[i].get("removed")]
@@ -279,7 +307,7 @@ def download_zip(ids: str, size: str = "web", by: str = "staff"):
             z.writestr(name, jpeg_bytes(r, size))
             writer.writerow([name, i + 1, r["caption"], r["activity"], r["location"], consent_of(r)])
         z.writestr("captions.csv", table.getvalue())
-    log_download(chosen, size, by)
+    log_download(chosen, size, who())
     return Response(buf.getvalue(), media_type="application/zip", headers={
         "Content-Disposition": f"attachment; filename=spotlight_{len(chosen)}_photos.zip"})
 
@@ -376,11 +404,11 @@ def layout(active):
     """Header and left sidebar shared by every page, like Google Photos."""
     ui.colors(primary="#24214f", secondary="#b9770e", accent="#b9770e")
     ui.add_css(CSS)
-    dark = ui.dark_mode(app.storage.general.get("dark", False))
+    dark = ui.dark_mode(app.storage.user.get("dark", False))  # per account, not for everyone
 
     def toggle_dark():
         dark.value = not dark.value
-        app.storage.general["dark"] = dark.value
+        app.storage.user["dark"] = dark.value
         mode_button.props(f"icon={'light_mode' if dark.value else 'dark_mode'}")
 
     with ui.left_drawer(value=True, fixed=True).props("width=230").classes("q-pt-sm spot-nav column no-wrap") as nav:
@@ -401,7 +429,7 @@ def layout(active):
                         with ui.item_section().props("side"):
                             ui.badge(str(n)).props("color=amber-8 rounded")
         ui.space()
-        visible = sum(1 for r in engine.rows if not r.get("removed"))
+        visible = sum(1 for r in engine.rows if not r.get("removed") and not video_of(r))
         with ui.column().classes("spot-nav-footer gap-1"):
             with ui.row().classes("items-center gap-2 no-wrap"):
                 ui.icon("lock", size="16px", color="amber-5")
@@ -437,11 +465,12 @@ def layout(active):
 
 
 def heart_button(photo_id):
-    """Favorite heart. Only kept in memory until the app restarts, saving comes later."""
+    """Favorite heart, saved per account."""
     def toggle():
-        FAVORITES.symmetric_difference_update({photo_id})
-        btn.props(f"icon={'favorite' if photo_id in FAVORITES else 'favorite_border'}")
-    btn = ui.button(icon="favorite" if photo_id in FAVORITES else "favorite_border").props("flat round dense size=sm color=pink-6")
+        on = photo_id not in favorites()
+        set_favorite(photo_id, on)
+        btn.props(f"icon={'favorite' if on else 'favorite_border'}")
+    btn = ui.button(icon="favorite" if photo_id in favorites() else "favorite_border").props("flat round dense size=sm color=pink-6")
     btn.on("click.stop", toggle)
     return btn
 
@@ -481,9 +510,22 @@ def photo_card(r, on_open, selection=None, on_select=None):
                 ui.label(item_name(r)).classes("text-caption text-grey-7")
                 if consent_of(r) == "OK for marketing":
                     ui.icon("verified", color="positive", size="xs").tooltip("Photo release signed: OK for marketing")
-            ui.label(r["caption"]).classes("text-body2 spot-caption").tooltip(r["caption"])
+            ui.label(r["caption"]).classes("text-body2")
+            # Event in navy, place in gold, moments in green. A label the AI is unsure about gets a "?"
+            # and a paler colour, so staff see what to check first. Staff-checked labels are always sure.
+            sure = r["status"] != "ai"
+            with ui.row().classes("gap-1 q-mt-xs"):
+                for text, conf, color, pale in ((r["activity"], r.get("activity_conf", 1), "#24214f", "#8e8aa8"),
+                                                (r["location"], r.get("location_conf", 1), "#b9770e", "#d4b98f")):
+                    unsure = not sure and conf < UNSURE
+                    ui.badge(text + ("?" if unsure else "")).style(
+                        f"background:{pale if unsure else color};font-size:13px;padding:3px 8px").tooltip(
+                        f"AI {conf:.0%} sure" if not sure else "Checked by staff")
+                for m in [m for m in r.get("moments", "").split(";") if m]:
+                    ui.badge(m).style("background:#3f8a78;font-size:13px;padding:3px 8px")
 
 
+UNSURE = 0.2  # labels below this AI confidence show with a "?" on the cards
 SAME_PHOTO = 0.985  # CLIP similarity above which two photos are copies of each other
 SIMILAR = 0.93      # above this two photos are very similar (same moment, scanned twice), staff decide
 NOT_DUPES = ROOT / "outputs" / "not_duplicates.json"  # pairs staff marked as "not duplicates"
@@ -519,7 +561,7 @@ def duplicates():
     the other copies are hidden. Pairs marked as not duplicates are never grouped again."""
     rows = [r for r in engine.rows if not r.get("removed") and not video_of(r)]
     skip = not_duplicates()
-    key = (len(rows), len(skip))
+    key = (tuple(r["id"] for r in rows), len(skip))
     if _dupes["key"] == key:
         return _dupes
     sims = engine.clip_emb @ engine.clip_emb.T
@@ -547,9 +589,8 @@ def download_photos(ids, size):
     ids = sorted(ids)
 
     def go():
-        by = quote(who())
-        ui.download(f"/download/{ids[0]}?size={size}&by={by}" if len(ids) == 1
-                    else f"/download-zip?ids={','.join(map(str, ids))}&size={size}&by={by}")
+        ui.download(f"/download/{ids[0]}?size={size}" if len(ids) == 1
+                    else f"/download-zip?ids={','.join(map(str, ids))}&size={size}")
 
     missing = [i for i in ids if consent_of(engine.rows[i]) != "OK for marketing"]
     if missing:
@@ -649,8 +690,11 @@ def index(person: str = "", location: str = "", kind: str = ""):
                         filters=sorted(k for k, v in filters().items() if v))
         hidden = duplicates()["hidden"]
         hits = [h for h in hits if h[0]["id"] not in hidden]
+        # Like Google Photos: Photos and Videos are separate, a person or a place shows both
         if kind == "video":
             hits = [h for h in hits if video_of(h[0])]
+        elif not (state["person"] or state["location"]):
+            hits = [h for h in hits if not video_of(h[0])]
         rows = one_per_video([r for r, _, _ in hits])
         n_videos = sum(1 for r in rows if video_of(r))
         counts = [f"{len(rows) - n_videos} photos"] if kind != "video" else []
@@ -676,12 +720,13 @@ def index(person: str = "", location: str = "", kind: str = ""):
         label = {"event": f"same event ({r['event_name']}, {r['event_id']})",
                  "location": f"same location ({r['location']})",
                  "person": "same person"}[kind]
-        status.text = f"{len(rows)} photos with the {label}"
+        rows = one_per_video([r] + rows)
+        status.text = f"{len(rows) - 1} more with the {label}"
         pivot_bar.clear()
         with pivot_bar:
             ui.chip(f"Pivot: {label}", icon="hub", removable=True,
                     on_value_change=lambda: run_search()).props("color=secondary text-color=white")
-        show(one_per_video([r] + rows))
+        show(rows)
 
     def show(rows):
         state["rows"] = rows
@@ -792,11 +837,39 @@ def index(person: str = "", location: str = "", kind: str = ""):
             photo_buttons.set_visibility(not video)
             photo_info.set_visibility(not video)
 
-            ui.label("Show me more").classes("text-overline q-mt-sm")
-            with ui.row().classes("gap-2"):
-                ui.button("Same event", icon="event", on_click=lambda: run_pivot(photo_id, "event")).props("outline dense")
-                ui.button("Same location", icon="place", on_click=lambda: run_pivot(photo_id, "location")).props("outline dense")
-                ui.button("Same person", icon="face", on_click=lambda: run_pivot(photo_id, "person")).props("outline dense")
+            # The caption to read, with its labels as chips. Clicking a chip shows more like it.
+            ui.label(r["caption"]).classes("text-body1 q-mt-sm")
+            with ui.row().classes("gap-1"):
+                ui.chip(r["activity"], icon="event", on_click=lambda: run_pivot(photo_id, "event")).props(
+                    "dense outline clickable").tooltip("Show the same event")
+                ui.chip(r["location"], icon="place", on_click=lambda: run_pivot(photo_id, "location")).props(
+                    "dense outline clickable").tooltip("Show the same place")
+                for m in [m for m in r.get("moments", "").split(";") if m]:
+                    ui.chip(m, icon="mood").props("dense outline")
+            # The three-way pivot from the brief: same event, same place, same person
+            with ui.row().classes("gap-2 q-mt-xs"):
+                ui.button("Same event", icon="event", on_click=lambda: run_pivot(photo_id, "event")).props(
+                    "outline dense no-caps")
+                ui.button("Same location", icon="place", on_click=lambda: run_pivot(photo_id, "location")).props(
+                    "outline dense no-caps")
+                ui.button("Same person", icon="face", on_click=lambda: run_pivot(photo_id, "person")).props(
+                    "outline dense no-caps")
+            # Questions only staff can answer. Saved at once, logged, and searchable when the answer is yes.
+            answers = dict(r.get("answers", {}))
+            ui.label("Questions for staff").classes("text-overline q-mt-sm")
+            for key, (question, _) in QUESTIONS.items():
+                def answer(e, key=key):
+                    if e.value == answers.get(key):
+                        return
+                    answers[key] = e.value
+                    engine.review(photo_id, "edited", {"answers": dict(answers)}, reviewer=who(),
+                                  note=f"{QUESTIONS[key][0]} {e.value}")
+                    applog.info("question_answered", photo=photo_id + 1, question=key)
+                    ui.notify("Saved", type="positive", timeout=800)
+                with ui.row().classes("w-full items-center justify-between no-wrap"):
+                    ui.label(question).classes("text-body2")
+                    ui.toggle({"yes": "Yes", "no": "No", "not sure": "Not sure"}, value=answers.get(key),
+                              on_change=answer).props("dense no-caps toggle-color=secondary size=sm")
             people = [p for p in r.get("person_ids", "").split(";") if p]
             if people:
                 with ui.row().classes("items-center gap-2"):
@@ -841,17 +914,17 @@ def index(person: str = "", location: str = "", kind: str = ""):
 
             with ui.row().classes("gap-2"):
                 ui.button("Accept description", icon="check", on_click=lambda: confirm(
-                    f"Mark the AI description of photo {photo_id + 1} as correct?", lambda: save("accepted"))).props(
+                    f"Mark the AI description of {item_name(r).lower()} as correct?", lambda: save("accepted"))).props(
                     "unelevated color=positive")
                 ui.button("Save my changes", icon="edit", on_click=lambda: confirm(
-                    f"Save your changes to the description of photo {photo_id + 1}?", lambda: save("edited"))).props(
+                    f"Save your changes to the description of {item_name(r).lower()}?", lambda: save("edited"))).props(
                     "unelevated color=primary")
 
             def remove():
                 for m in (video_moments(video[0]) if video else [r]):  # a video goes to the bin with all its moments
                     engine.remove(m["id"], reviewer=who())
                 applog.info("remove", photo=photo_id + 1)
-                FAVORITES.discard(photo_id)
+                set_favorite(photo_id, False)
                 drawer.hide()
                 ui.notify(f"{item_name(r)} moved to the bin. Restore it from the Bin page.", type="warning")
                 run_search()
@@ -863,6 +936,8 @@ def index(person: str = "", location: str = "", kind: str = ""):
         drawer.show()
 
     search_box.on("keydown.enter", lambda: run_search())
+    # The clear event arrives before the box's new value, so empty it here first
+    search_box.on("clear", lambda: (search_box.set_value(""), run_search()))
     # Esc closes the photo panel from anywhere on the page
     ui.keyboard(on_key=lambda e: close_detail() if e.key.name == "Escape" and e.action.keydown else None,
                 ignore=[])
@@ -872,13 +947,17 @@ def index(person: str = "", location: str = "", kind: str = ""):
 @ui.page("/people")
 def people_page():
     layout("/people")
-    counts = {}
+    counts, videos = {}, {}  # photos per person, and the videos they are in (a video counts once)
     for r in engine.rows:
         if r.get("removed"):
             continue
         for p in r.get("person_ids", "").split(";"):
-            if p:
+            if p and video_of(r):
+                videos.setdefault(p, set()).add(video_of(r)[0])
+            elif p:
                 counts[p] = counts.get(p, 0) + 1
+    for p in videos:
+        counts.setdefault(p, 0)
     with ui.column().classes("w-full q-pa-lg gap-3"):
         ui.label("People").classes("text-h5")
         ui.label("Anonymous groups made from faces (P01, P02...). No names and no identity lookup. "
@@ -887,12 +966,14 @@ def people_page():
             ui.label("No person groups yet. Run python pipeline.py to create them.").classes("text-grey-7")
         with ui.element("div").classes("w-full").style(
                 "display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:20px"):
-            for p, n in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
+            for p, n in sorted(counts.items(), key=lambda x: (-x[1] - len(videos.get(x[0], ())), x[0])):
                 with ui.column().classes("items-center cursor-pointer").on(
                         "click", lambda p=p: ui.navigate.to(f"/?person={p}")):
                     ui.image(f"/face/{p}").classes("rounded-full").style("width:130px;height:130px").props("fit=cover")
                     ui.label(p).classes("text-weight-bold")
-                    ui.label(f"{n} photos").classes("text-caption text-grey-7")
+                    v = len(videos.get(p, ()))
+                    ui.label(f"{n} photos" + (f", {v} video{'s' if v != 1 else ''}" if v else "")).classes(
+                        "text-caption text-grey-7")
 
 
 @ui.page("/places")
@@ -909,14 +990,17 @@ def places_page():
         with ui.element("div").classes("w-full").style(
                 "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px"):
             for place, rows in sorted(places.items(), key=lambda x: -len(x[1])):
-                cover = max(rows, key=lambda r: r["location_conf"])
+                stills = [r for r in rows if not video_of(r)]
+                n_videos = len({video_of(r)[0] for r in rows if video_of(r)})
+                cover = max(stills or rows, key=lambda r: r["location_conf"])
                 with ui.card().tight().classes("cursor-pointer relative").on(
                         "click", lambda place=place: ui.navigate.to(f"/?location={place}")):
                     ui.image(f"/photo/{cover['id']}/thumb").classes("h-48").props(f"fit=cover position='{focus(cover['id'])}'")
                     with ui.element("div").classes("absolute-bottom q-pa-sm").style(
                             "background:linear-gradient(transparent,rgba(0,0,0,.7))"):
                         ui.label(place.capitalize()).classes("text-white text-weight-bold")
-                        ui.label(f"{len(rows)} photos").classes("text-white text-caption")
+                        ui.label(f"{len(stills)} photos" + (f", {n_videos} video{'s' if n_videos != 1 else ''}"
+                                 if n_videos else "")).classes("text-white text-caption")
 
 
 @ui.page("/favorites")
@@ -924,17 +1008,16 @@ def favorites_page():
     layout("/favorites")
     with ui.column().classes("w-full q-pa-lg gap-3"):
         ui.label("Favorites").classes("text-h5")
-        ui.label("Click the heart on any photo to add it here. For now favorites are kept until the app "
-                 "restarts, saving them comes later.").classes("text-grey-7")
-        favs = [engine.rows[i] for i in sorted(FAVORITES) if not engine.rows[i].get("removed")]
-        if favs:
+        ui.label("Click the heart on any photo or video to add it here. Your favorites are only yours.").classes(
+            "text-grey-7")
+        favs = [engine.rows[i] for i in sorted(favorites())
+                if i < len(engine.rows) and not engine.rows[i].get("removed")]
+        photos = [r["id"] for r in favs if not video_of(r)]  # videos download from their own panel
+        if photos:
             with ui.row().classes("gap-2"):
-                ui.button("Download all (web size)", icon="download",
-                          on_click=lambda: download_photos([r["id"] for r in favs], "web")).props(
+                ui.button("Download", icon="download",
+                          on_click=lambda: download_photos(photos, "original")).props(
                     "unelevated color=secondary")
-                ui.button("Download all (original)", icon="download",
-                          on_click=lambda: download_photos([r["id"] for r in favs], "original")).props(
-                    "outline color=secondary")
         with ui.element("div").classes("w-full").style(GRID):
             if not favs:
                 ui.label("No favorites yet.").classes("text-grey-7")
@@ -1022,10 +1105,11 @@ def audit_rows(action="", person=""):
 @app.get("/api/audit.csv")
 def audit_csv(action: str = "", person: str = ""):
     """The review log as a spreadsheet, for DCT's records."""
+    admin_api()
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=["time", "photo", "action", "who", "changed", "note"])
     writer.writeheader()
-    writer.writerows(audit_rows(action, person))
+    writer.writerows(map(safe_cells, audit_rows(action, person)))
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=spotlight_review_log.csv"})
 
@@ -1117,10 +1201,16 @@ def bin_page():
         left = max(0, int((gone - datetime.now().timestamp()) // 86400) + 1)
         return f"deleted for good in {left} day{'s' if left != 1 else ''}"
 
+    def with_moments(r):
+        """A video in the bin is all its moments, a photo is itself."""
+        v = video_of(r)
+        return [x["id"] for x in engine.bin() if v and video_of(x) and video_of(x)[0] == v[0]] if v else [r["id"]]
+
     def restore(r):
-        engine.restore(r["id"], reviewer=who())
+        for i in with_moments(r):
+            engine.restore(i, reviewer=who())
         applog.info("restore", photo=r["id"] + 1)
-        ui.notify(f"Photo {r['id'] + 1} is back in the archive", type="positive")
+        ui.notify(f"{item_name(r).split(' at ')[0]} is back in the archive", type="positive")
         ui.navigate.reload()
 
     def delete_forever(ids):
@@ -1132,12 +1222,17 @@ def bin_page():
             ui.navigate.reload()
         confirm(f"Delete {len(ids)} photo{'s' if len(ids) != 1 else ''} for good? This cannot be undone.", go)
 
+    def restore_all():
+        for r in engine.bin():
+            engine.restore(r["id"], reviewer=who())
+        ui.navigate.reload()
+
     def set_days(e):
         save_settings(bin_days=e.value)
         applog.info("bin_setting_changed", days=e.value)
         ui.navigate.reload()
 
-    items = sorted(engine.bin(), key=lambda r: r["removed_at"], reverse=True)
+    items = one_per_video(sorted(engine.bin(), key=lambda r: (r["removed_at"], -r["id"]), reverse=True))
     with ui.column().classes("w-full q-pa-lg gap-3"):
         ui.label("Bin").classes("text-h5")
         ui.label("Photos moved to the bin are hidden everywhere. Restore them, or they are deleted for good "
@@ -1146,11 +1241,9 @@ def bin_page():
             ui.select(BIN_CHOICES, value=days, label="Empty the bin automatically", on_change=set_days).props(
                 "outlined dense").classes("w-64")
             if items:
-                ui.button("Restore all", icon="restore", on_click=lambda: [engine.restore(r["id"], reviewer=who())
-                                                                            for r in items] and ui.navigate.reload()
-                          ).props("outline color=secondary")
+                ui.button("Restore all", icon="restore", on_click=lambda: restore_all()).props("outline color=secondary")
                 ui.button("Empty bin now", icon="delete_forever",
-                          on_click=lambda: delete_forever([r["id"] for r in items])).props("outline color=negative")
+                          on_click=lambda: delete_forever([r["id"] for r in engine.bin()])).props("outline color=negative")
         if not items:
             ui.label("The bin is empty.").classes("text-grey-7 q-mt-md")
         with ui.element("div").classes("w-full").style(GRID):
@@ -1158,12 +1251,12 @@ def bin_page():
                 with ui.card().tight():
                     ui.image(f"/photo/{r['id']}/thumb").classes("h-40").props(f"fit=cover position='{focus(r['id'])}'").style("opacity:.6")
                     with ui.card_section().classes("q-pa-sm"):
-                        ui.label(item_name(r)).classes("text-weight-bold")
+                        ui.label(item_name(r).split(" at ")[0]).classes("text-weight-bold")
                         ui.label(f"Moved {r['removed_at'][:10]} · {days_left(r)}").classes("text-caption text-grey-7")
                         with ui.row().classes("gap-1 q-mt-xs"):
                             ui.button("Restore", icon="restore", on_click=lambda r=r: restore(r)).props(
                                 "dense unelevated color=secondary")
-                            ui.button(icon="delete_forever", on_click=lambda r=r: delete_forever([r["id"]])).props(
+                            ui.button(icon="delete_forever", on_click=lambda r=r: delete_forever(with_moments(r))).props(
                                 "dense flat color=negative").tooltip("Delete for good")
 
 
@@ -1260,7 +1353,12 @@ class LoginRequired(BaseHTTPMiddleware):
     OPEN = ("/login", "/setup", "/_nicegui", "/static", "/favicon")
 
     async def dispatch(self, request: Request, call_next):
-        if not app.storage.user.get("authenticated", False) and not request.url.path.startswith(self.OPEN):
+        if request.url.path.startswith(self.OPEN):
+            return await call_next(request)
+        user = app.storage.user
+        if user.get("authenticated") and user.get("username") not in accounts.users():
+            user.update(authenticated=False, username=None, role=None)  # the account was removed
+        if not user.get("authenticated", False):
             return RedirectResponse("/setup" if not accounts.any_users() else "/login")
         return await call_next(request)
 
@@ -1412,9 +1510,19 @@ def accounts_page():
             ui.button("Add", icon="person_add", on_click=add).props("unelevated color=secondary")
 
 
+def storage_secret():
+    """Signs the login cookie. Random per laptop and kept out of git (outputs/), so nobody can forge a
+    login with a secret read from GitHub."""
+    path = ROOT / "outputs" / "storage_secret.txt"
+    if not path.exists():
+        import secrets
+        path.write_text(secrets.token_hex(32), encoding="utf-8")
+    return path.read_text(encoding="utf-8").strip()
+
+
 if __name__ in {"__main__", "__mp_main__"}:
     empty_old_bin()
     applog.info("startup", photos=sum(1 for r in engine.rows if not r.get("removed")), faces=len(FACES))
     ui.run(host="127.0.0.1", port=8080, title="spotlight.io", favicon=ROOT / "static" / "logo.svg",
-           storage_secret="spotlight-local-only",
+           storage_secret=storage_secret(),
            reload=False, show=False, fastapi_docs=True)

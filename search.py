@@ -33,7 +33,16 @@ TEXT_SHARE = 0.6      # and at least this share of the best caption match
 KEYWORD_SHARE = 0.5   # keyword score at least this share of the best keyword match
 MIN_IMAGE = 0.21      # photo content (CLIP cosine)
 IMAGE_MARGIN = 0.03   # and at most this far below the best photo match
-EDITABLE = {"caption", "activity", "location", "person_attributes", "objects", "moments", "consent"}
+EDITABLE = {"caption", "activity", "location", "person_attributes", "objects", "moments", "consent", "answers"}
+
+# Questions staff answer in the app. The AI never guesses these, only people who know the family do.
+# A "yes" adds the words to the search text, so searching "family" finds those photos.
+QUESTIONS = {
+    "family": ("Is this a family?", "family"),
+    "staff": ("Are DCT staff or volunteers in the photo?", "dct staff volunteers"),
+    "wish": ("Is this the wish moment itself?", "wish moment"),
+    "newsletter": ("Good photo for the newsletter?", "newsletter favorite"),
+}
 
 
 # Filler words appear in almost every caption, so they would match every photo
@@ -72,7 +81,9 @@ def search_text(r):
     attrs = r["person_attributes"].replace(";", ", ")
     objects = r.get("objects", "").replace(";", ", ")
     moments = r.get("moments", "").replace(";", ", ")
-    return f"{r['caption']}. {r['activity']} at {r['location']}. {attrs}. {objects}. {moments}. {r.get('speech', '')}"
+    said_yes = " ".join(QUESTIONS[k][1] for k, v in r.get("answers", {}).items() if v == "yes" and k in QUESTIONS)
+    return (f"{r['caption']}. {r['activity']} at {r['location']}. {attrs}. {objects}. {moments}. "
+            f"{said_yes}. {r.get('speech', '')}")
 
 
 class SearchEngine:
@@ -238,6 +249,9 @@ class SearchEngine:
         r["status"] = entry["decision"]
         if changes:
             self.bm25 = BM25([search_text(x) for x in self.rows])
+            # The meaning search reads a vector of the description, so it is made again from the new text
+            self.text_emb[photo_id] = self._text_query(search_text(r))
+            np.save(OUT / "text_embeddings.npy", self.text_emb)
         self._save_rows()
         self._log(entry)
         return entry
@@ -320,7 +334,10 @@ class SearchEngine:
         return len(old)
 
     def _save_rows(self):
-        (OUT / "photos.json").write_text(json.dumps(self.rows, indent=1), encoding="utf-8")
+        """Writes a new file first and then swaps it in, so a crash never leaves half a photos.json."""
+        tmp = OUT / "photos.json.tmp"
+        tmp.write_text(json.dumps(self.rows, indent=1), encoding="utf-8")
+        tmp.replace(OUT / "photos.json")
 
     def _log(self, entry):
         with open(OUT / "audit_log.jsonl", "a", encoding="utf-8") as f:
