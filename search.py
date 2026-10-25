@@ -33,7 +33,7 @@ TEXT_SHARE = 0.6      # and at least this share of the best caption match
 KEYWORD_SHARE = 0.5   # keyword score at least this share of the best keyword match
 MIN_IMAGE = 0.21      # photo content (CLIP cosine)
 IMAGE_MARGIN = 0.03   # and at most this far below the best photo match
-EDITABLE = {"caption", "activity", "location", "person_attributes", "objects"}
+EDITABLE = {"caption", "activity", "location", "person_attributes", "objects", "moments", "consent"}
 
 
 # Filler words appear in almost every caption, so they would match every photo
@@ -71,7 +71,8 @@ class BM25:
 def search_text(r):
     attrs = r["person_attributes"].replace(";", ", ")
     objects = r.get("objects", "").replace(";", ", ")
-    return f"{r['caption']}. {r['activity']} at {r['location']}. {attrs}. {objects}"
+    moments = r.get("moments", "").replace(";", ", ")
+    return f"{r['caption']}. {r['activity']} at {r['location']}. {attrs}. {objects}. {moments}"
 
 
 class SearchEngine:
@@ -162,6 +163,10 @@ class SearchEngine:
             ids = {i for i in ids if filters["attribute"] in self.rows[i]["person_attributes"].split(";")}
         if filters.get("person"):
             ids = {i for i in ids if filters["person"] in self.rows[i].get("person_ids", "").split(";")}
+        if filters.get("moment"):
+            ids = {i for i in ids if filters["moment"] in self.rows[i].get("moments", "").split(";")}
+        if filters.get("consent"):
+            ids = {i for i in ids if self.rows[i].get("consent", "unknown") == filters["consent"]}
         if filters.get("ids") is not None:
             ids &= set(filters["ids"])
         if filters.get("year"):
@@ -212,6 +217,7 @@ class SearchEngine:
             "activity": sorted({r["activity"] for r in rows}),
             "location": sorted({r["location"] for r in rows}),
             "attribute": sorted({a for r in rows for a in r["person_attributes"].split(";") if a}),
+            "moment": sorted({m for r in rows for m in r.get("moments", "").split(";") if m}),
             "year": sorted({r["taken"][:4] for r in rows if r["taken"]}, reverse=True),
         }
 
@@ -238,7 +244,7 @@ class SearchEngine:
 
     # Adding and removing photos
 
-    def add(self, rows, clip_emb, text_emb, attr_emb):
+    def add(self, rows, clip_emb, text_emb, attr_emb, reviewer="staff"):
         """Appends newly processed photos. Same day as a known event = that event, else a new one."""
         days = {x["taken"][:10]: x for x in self.rows if x["taken"]}
         next_event = max(int(x["event_id"][1:]) for x in self.rows) + 1 if self.rows else 1
@@ -254,7 +260,7 @@ class SearchEngine:
             r.setdefault("person_ids", "")
             self.rows.append(r)
             self._log({"time": datetime.now().isoformat(timespec="seconds"), "photo_id": r["id"],
-                       "decision": "added", "reviewer": "staff", "before": {}, "after": {}, "note": ""})
+                       "decision": "added", "reviewer": reviewer, "before": {}, "after": {}, "note": ""})
         self.clip_emb = np.vstack([self.clip_emb, clip_emb])
         self.text_emb = np.vstack([self.text_emb, text_emb])
         self.attr_emb = np.vstack([self.attr_emb, attr_emb])
@@ -273,11 +279,45 @@ class SearchEngine:
             REMOVED.mkdir(parents=True, exist_ok=True)
             src.rename(REMOVED / r["file"])
         r["removed"] = True
+        r["removed_at"] = datetime.now().isoformat(timespec="seconds")
         self._save_rows()
         entry = {"time": datetime.now().isoformat(timespec="seconds"), "photo_id": photo_id,
-                 "decision": "removed", "reviewer": reviewer, "before": {}, "after": {}, "note": note}
+                 "decision": "moved to bin", "reviewer": reviewer, "before": {}, "after": {}, "note": note}
         self._log(entry)
         return entry
+
+    # The bin: removed photos wait in data/removed until they are restored or deleted for good
+
+    def bin(self):
+        return [r for r in self.rows if r.get("removed") and not r.get("deleted")]
+
+    def restore(self, photo_id, reviewer="staff"):
+        r = self.rows[photo_id]
+        src = REMOVED / r["file"]
+        if src.exists():
+            src.rename(DATA / r["file"])
+        r.pop("removed", None)
+        r.pop("removed_at", None)
+        self._save_rows()
+        self._log({"time": datetime.now().isoformat(timespec="seconds"), "photo_id": photo_id,
+                   "decision": "restored", "reviewer": reviewer, "before": {}, "after": {}, "note": ""})
+
+    def delete_forever(self, photo_id, reviewer="staff", note=""):
+        """Deletes the file for good. The record stays (marked deleted) so photo numbers never shift."""
+        r = self.rows[photo_id]
+        (REMOVED / r["file"]).unlink(missing_ok=True)
+        r["deleted"] = True
+        self._save_rows()
+        self._log({"time": datetime.now().isoformat(timespec="seconds"), "photo_id": photo_id,
+                   "decision": "deleted forever", "reviewer": reviewer, "before": {}, "after": {}, "note": note})
+
+    def empty_old(self, days, reviewer="automatic"):
+        """Deletes bin photos older than the number of days the admin chose. Returns how many."""
+        cutoff = datetime.now().timestamp() - days * 86400
+        old = [r for r in self.bin() if datetime.fromisoformat(r.get("removed_at", "1970-01-01")).timestamp() < cutoff]
+        for r in old:
+            self.delete_forever(r["id"], reviewer, f"older than {days} days")
+        return len(old)
 
     def _save_rows(self):
         (OUT / "photos.json").write_text(json.dumps(self.rows, indent=1), encoding="utf-8")

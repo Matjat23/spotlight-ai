@@ -98,6 +98,9 @@ CLOTHING = {
     "wheelchair": "a person in a wheelchair",
     "stroller": "a child in a stroller",
 }
+# Visible moments, not feelings. We never label what a child feels inside (sad, scared, tired),
+# only what anyone can see in the photo. Staff can correct them in the app.
+MOMENTS = ["smiling", "laughing", "hugging", "cheering", "celebrating", "dancing", "posing", "playing"]
 ATTR_THRESHOLD = 0.23  # cosine similarity for the CLIP fallback, tune on the test set
 TOP_ATTRS = 3
 EVENT_DISTANCE = 0.18  # how different two undated photos can be and still count as one event
@@ -105,7 +108,7 @@ SAME_SCENE = 0.90      # photos this similar in one event are the same scene and
 
 QWEN_PROMPT = f"""Describe this event photo for a searchable photo archive of a children's charity.
 Answer with JSON only, in this form:
-{{"caption": "...", "activity": "...", "location": "...", "clothing": [...], "objects": [...]}}
+{{"caption": "...", "activity": "...", "location": "...", "clothing": [...], "objects": [...], "moments": [...]}}
 Rules:
 - caption: one plain sentence about what is clearly visible. Say "a child", "an adult" or "a group".
   Never guess names, family relationships (mother, father, son, family), illness or feelings.
@@ -114,6 +117,8 @@ Rules:
 - clothing: every item from this list that a person in the photo clearly wears or uses: {list(CLOTHING)}.
   Use an empty list if you are not sure.
 - objects: up to 5 clearly visible objects. Leave out anything you are not sure about.
+- moments: every item from this list that is clearly visible: {MOMENTS}. Empty list if none.
+  Never describe feelings like sad, scared or tired.
   A person in a full animal costume is a "mascot", not a stuffed animal."""
 
 # BLIP and Qwen sometimes guess family roles. We do not know who people are, so captions stay neutral.
@@ -145,9 +150,31 @@ def clean_caption(cap):
     return cap[:1].upper() + cap[1:]
 
 
+ROTATIONS = OUT / "rotations.json"  # file name -> degrees clockwise, for photos saved sideways
+
+
+def rotations():
+    return json.loads(ROTATIONS.read_text(encoding="utf-8")) if ROTATIONS.exists() else {}
+
+
+def set_rotation(file_name, degrees):
+    known = rotations()
+    known[file_name] = degrees % 360
+    if not known[file_name]:
+        del known[file_name]
+    ROTATIONS.write_text(json.dumps(known, indent=1), encoding="utf-8")
+
+
+def open_upright(path):
+    """The photo the right way up: the camera's own rotation tag first, then our fix for photos
+    whose tag was lost (found by fix_rotation.py or the Rotate button in the app)."""
+    img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    degrees = rotations().get(Path(path).name, 0)
+    return img.rotate(-degrees, expand=True) if degrees else img
+
+
 def load_image(path, max_side=1024):
-    img = Image.open(path)
-    img = ImageOps.exif_transpose(img).convert("RGB")
+    img = open_upright(path)
     img.thumbnail((max_side, max_side))
     return img
 
@@ -366,6 +393,7 @@ def process_photos(files, start_id):
             "location_conf": round(loc_conf, 2),
             "person_attributes": ";".join(dict.fromkeys(c for c in d.get("clothing", []) if c in CLOTHING)),
             "objects": ";".join(str(o).strip().lower() for o in d.get("objects", [])[:5]),
+            "moments": ";".join(dict.fromkeys(m for m in d.get("moments", []) if m in MOMENTS)),
             "person_ids": "",
             "taken": when.isoformat(sep=" ") if when else "",
             "orientation": "portrait" if img.height > img.width else "landscape",
@@ -375,7 +403,8 @@ def process_photos(files, start_id):
     text_tok = AutoTokenizer.from_pretrained(TEXT_NAME)
     text_model = AutoModel.from_pretrained(TEXT_NAME).to(device).eval()
     search_text = [f"{r['caption']}. {r['activity']} at {r['location']}. "
-                   f"{r['person_attributes'].replace(';', ', ')}. {r['objects'].replace(';', ', ')}" for r in rows]
+                   f"{r['person_attributes'].replace(';', ', ')}. {r['objects'].replace(';', ', ')}. "
+                   f"{r['moments'].replace(';', ', ')}" for r in rows]
     attr_text = [r["person_attributes"].replace(";", ", ") or "no visible attributes" for r in rows]
     result = (rows, img_emb.float().cpu().numpy(), text_embed(search_text, text_tok, text_model, device),
               text_embed(attr_text, text_tok, text_model, device))
@@ -461,6 +490,7 @@ def main():
                 "location_conf": round(loc_conf, 2),
                 "person_attributes": ";".join(clothing),
                 "objects": ";".join(objects),
+                "moments": ";".join(dict.fromkeys(m for m in d.get("moments", []) if m in MOMENTS)),
                 "taken": when.isoformat(sep=" ") if when else "",
                 "orientation": "portrait" if img.height > img.width else "landscape",
                 "person_ids": ";".join(sorted(people[len(rows)])),
@@ -475,7 +505,8 @@ def main():
 
     # Text embeddings: one for full search, one for the clothing only (same-person pivot)
     search_text = [f"{r['caption']}. {r['activity']} at {r['location']}. "
-                   f"{r['person_attributes'].replace(';', ', ')}. {r['objects'].replace(';', ', ')}" for r in rows]
+                   f"{r['person_attributes'].replace(';', ', ')}. {r['objects'].replace(';', ', ')}. "
+                   f"{r['moments'].replace(';', ', ')}" for r in rows]
     attr_text = [r["person_attributes"].replace(";", ", ") or "no visible attributes" for r in rows]
     np.save(OUT / "clip_embeddings.npy", img_all)
     np.save(OUT / "text_embeddings.npy", text_embed(search_text, text_tok, text_model, device))

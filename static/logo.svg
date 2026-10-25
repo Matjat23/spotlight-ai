@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 110 105" role="img" aria-label="spotlight.io logo">
+  <title>spotlight.io</title>
+  <!-- Two stage lamps -->
+  <g transform="rotate(-28 14 10)"><rect x="5" y="2" width="18" height="10" rx="2" fill="#3a3670"/><rect x="8" y="11" width="12" height="4" fill="#f2c063"/></g>
+  <g transform="rotate(28 96 10)"><rect x="87" y="2" width="18" height="10" rx="2" fill="#3a3670"/><rect x="90" y="11" width="12" height="4" fill="#f2c063"/></g>
+  <!-- Crossing beams and the lit floor -->
+  <path d="M16 16 L22 12 L80 94 L42 98 Z" fill="#f2c063" opacity=".15"/>
+  <path d="M94 16 L88 12 L30 94 L68 98 Z" fill="#f2c063" opacity=".15"/>
+  <ellipse cx="55" cy="95" rx="30" ry="5" fill="#f2c063" opacity=".45"/>
+  <!-- Golden heart with a highlight -->
+  <path d="M55 91 C34 77 32 64 41 58 C48 54 53 58 55 64 C57 58 62 54 69 58 C78 64 76 77 55 91 Z" fill="#f2c063"/>
+  <path d="M44 64 C46 60 50 60 52 63" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" opacity=".85"/>
+  <!-- Sparkles -->
+  <g fill="#fff">
+    <path d="M30 50 L31 53 L34 54 L31 55 L30 58 L29 55 L26 54 L29 53 Z"/>
+    <path d="M82 46 L83 49 L86 50 L83 51 L82 54 L81 51 L78 50 L81 49 Z"/>
+  </g>
+</svg>

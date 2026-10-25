@@ -58,3 +58,9 @@ secrets/
 
 # Internal team notes (strategy, not for the public repo)
 PREP.md
+
+# App logs stay on this laptop
+logs/
+
+# Staff accounts (password hashes) stay on this laptop
+accounts.json
