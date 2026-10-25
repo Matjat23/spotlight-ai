@@ -16,6 +16,10 @@ HF_MODELS = [
     "sentence-transformers/all-MiniLM-L6-v2",  # text embeddings
     "Qwen/Qwen2.5-1.5B-Instruct",              # turns a search into text + filters
     "Qwen/Qwen2.5-VL-3B-Instruct",             # structured captions: event, location, clothing
+    "HuggingFaceTB/SmolVLM-500M-Instruct",     
+    "florence-community/Florence-2-large",
+    "vikhyatk/moondream2",
+    "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
 ]
 
 # Skip formats we do not use (TensorFlow, Flax, ONNX) to save disk space

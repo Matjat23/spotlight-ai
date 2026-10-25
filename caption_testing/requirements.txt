@@ -1,0 +1,9 @@
+# Uses the project's existing PyTorch installation (CPU or CUDA).
+# Minimum Transformers version for native Florence-2 support.
+transformers>=4.57,<6
+accelerate>=1.0
+pillow>=10
+pillow-heif>=0.20
+timm
+einops
+sentencepiece
