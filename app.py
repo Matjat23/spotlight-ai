@@ -555,6 +555,26 @@ def _groups(ids, linked):
     return [g for g in groups.values() if len(g) > 1]
 
 
+def _close_groups(ids, sims, threshold, allowed):
+    """Very similar photos, where every photo in a group is close to every other one. Joining through
+    a shared photo chained different moments together (98 and 99 only both looked like 101).
+    The closest pairs are joined first, and a photo only joins a group it matches completely."""
+    pairs = sorted(((sims[a, b], a, b) for i, a in enumerate(ids) for b in ids[i + 1:]
+                    if sims[a, b] >= threshold and allowed(a, b)), reverse=True)
+    group_of, groups = {}, []
+    for _, a, b in pairs:
+        ga, gb = group_of.get(a), group_of.get(b)
+        if ga is None and gb is None:
+            groups.append([a, b])
+            group_of[a] = group_of[b] = len(groups) - 1
+        elif (ga is None) != (gb is None):
+            g, new = (ga, b) if gb is None else (gb, a)
+            if all(sims[new, m] >= threshold and allowed(new, m) for m in groups[g]):
+                groups[g].append(new)
+                group_of[new] = g
+    return [sorted(g) for g in groups]
+
+
 def duplicates():
     """Exact copies (same file name with another extension, like an iPhone .heic and its .jpg, or a
     practically identical photo) and very similar photos. One card per copy group is shown in the grid,
@@ -579,7 +599,7 @@ def duplicates():
         copies[keep] = [i for i in members if i != keep]
         hidden.update(copies[keep])
     shown = [r["id"] for r in rows if r["id"] not in hidden]
-    similar = _groups(shown, lambda a, b: allowed(a, b) and sims[a, b] >= SIMILAR)
+    similar = _close_groups(shown, sims, SIMILAR, allowed)
     _dupes.update(key=key, copies=copies, hidden=hidden, similar=similar)
     return _dupes
 

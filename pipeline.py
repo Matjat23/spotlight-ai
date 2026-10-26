@@ -35,6 +35,7 @@ register_heif_opener()
 
 ROOT = Path(__file__).parent
 DATA = ROOT / "data" / "raw"
+BIN = ROOT / "data" / "removed"  # photos staff moved to the bin in the app
 OUT = ROOT / "outputs"
 EXTS = {".jpg", ".jpeg", ".png", ".heic"}
 
@@ -442,14 +443,19 @@ def staff_yes(r):
 STAFF_FIELDS = ["caption", "activity", "location", "person_attributes", "objects", "moments"]
 
 
-def keep_staff_changes(rows):
+def keep_staff_changes(rows, bin_files=()):
     """A new run must not undo what staff did in the app. For every photo we already knew (same file):
     captions and labels staff accepted or edited win over the new AI ones, and the photo release
-    is always kept. Runs before the search vectors are made, so search reads the staff text."""
+    is always kept. Photos in the bin stay in the bin, with the day they were moved there, so the
+    automatic emptying still counts from that day. Runs before the search vectors are made, so
+    search reads the staff text."""
     old_file = OUT / "photos.json"
-    if not old_file.exists():
-        return
-    old = {r["file"]: r for r in json.loads(old_file.read_text(encoding="utf-8"))}
+    old = {r["file"]: r for r in json.loads(old_file.read_text(encoding="utf-8"))} if old_file.exists() else {}
+    now = datetime.now().isoformat(timespec="seconds")
+    for r in rows:
+        if r["file"] in bin_files:
+            r["removed"] = True
+            r["removed_at"] = old.get(r["file"], {}).get("removed_at", now)
     kept = 0
     for r in rows:
         before = old.get(r["file"])
@@ -463,10 +469,7 @@ def keep_staff_changes(rows):
             r.update({k: before[k] for k in STAFF_FIELDS if k in before})
             r["status"] = before["status"]
             kept += 1
-    in_bin = sum(1 for r in old.values() if r.get("removed") and not r.get("deleted"))
-    print(f"Kept staff changes on {kept} photos")
-    if in_bin:
-        print(f"Note: {in_bin} photos in the bin are left out of this run (their files are in data/removed)")
+    print(f"Kept staff changes on {kept} photos, {len(bin_files)} photos stay in the bin")
 
 
 def main():
@@ -477,7 +480,10 @@ def main():
     parser.add_argument("--no-faces", action="store_true", help="skip face grouping")
     args = parser.parse_args()
 
-    files = sorted(p for p in DATA.iterdir() if p.suffix.lower() in EXTS)
+    # Bin photos are described too, so they keep their number and can still be restored in the app.
+    # Sorting by name over both folders gives every photo the same number it had before.
+    in_bin = [p for p in BIN.iterdir() if p.suffix.lower() in EXTS] if BIN.exists() else []
+    files = sorted((p for p in [*DATA.iterdir(), *in_bin] if p.suffix.lower() in EXTS), key=lambda p: p.name)
     if args.limit:
         files = files[: args.limit]
     if not files:
@@ -560,7 +566,7 @@ def main():
     img_all = np.concatenate(embeddings)
     group_events(rows, img_all)
     harmonize_scenes(rows, img_all)
-    keep_staff_changes(rows)
+    keep_staff_changes(rows, {p.name for p in in_bin})
 
     # Text embeddings: one for full search, one for the clothing only (same-person pivot)
     search_text = [f"{r['caption']}. {r['activity']} at {r['location']}. "
